@@ -1,63 +1,146 @@
 //! Per-command pipelines (design-specs §7).
 //!
-//! Phase 1 wires Stage 0 (the candidate finder) into the I/O path. With no
-//! semantic engine yet (Phase 2), a textual hit degrades to the `fallback`
-//! rung of the ladder (design-specs §9): we emit a verbatim line-window around
-//! the first hit. `not_found` is still produced when there are zero hits.
+//! Phase 2 wires the syntactic engine (Stage 1) into `find-def`/`find-decl`.
+//! Each target runs the degradation ladder (design-specs §9):
+//!   engine resolves 1 → `resolved`; >1 → `ambiguous`; 0 (but text hits) →
+//!   `fallback` text window; 0 text hits → `not_found`.
+//! `find-refs` keeps the Phase 1 location/window behavior until Phase 5.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
 use crate::cli::{Cli, Command};
-use crate::output::{Record, TextWindow, Writer};
-use crate::search::{self, FinderConfig, DEFAULT_EXTENSIONS};
+use crate::engine::{Engine, SyntacticEngine};
+use crate::model::{Kind, Resolution};
+use crate::output::{self, Record, TextWindow, Writer};
+use crate::search::{self, FinderConfig, FinderResult, DEFAULT_EXTENSIONS};
+
+/// Which resolution a command asks the engine for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Query {
+    Definition,
+    Declaration,
+    /// Reference search — handled by the text path (Phase 5 adds context).
+    References,
+}
 
 /// Run the selected command, writing records to stdout.
 pub fn dispatch(cli: &Cli) -> Result<()> {
-    let (command_name, targets) = match &cli.command {
-        Command::FindDef { name, .. } => ("find-def", name),
-        Command::FindDecl { name } => ("find-decl", name),
-        Command::FindRefs { name, .. } => ("find-refs", name),
+    let (command_name, targets, query) = match &cli.command {
+        Command::FindDef { name, .. } => ("find-def", name, Query::Definition),
+        Command::FindDecl { name } => ("find-decl", name, Query::Declaration),
+        Command::FindRefs { name, .. } => ("find-refs", name, Query::References),
     };
 
     let finder_cfg = build_finder_config(cli);
+    let engine = SyntacticEngine::new();
 
     let stdout = std::io::stdout();
     let mut writer = Writer::new(stdout.lock(), cli.format, cli.legend);
 
     for target in targets {
         let result = search::find_candidates(target, &finder_cfg)?;
-        let record = if result.candidates.is_empty() {
-            Record::not_found(command_name, target)
-        } else {
-            // TODO(phase 2+): hand candidates to the syntactic engine for exact
-            // boundaries. Until then, degrade to a verbatim text window.
-            let hit = &result.candidates[0];
-            let (buffer, before, after) =
-                read_window(&hit.file_path, hit.line, cli.window)
-                    .unwrap_or_else(|_| (hit.snippet.clone(), 0, 0));
-            let window = TextWindow {
-                file_path: hit.file_path.to_string_lossy().into_owned(),
-                approximate_line: hit.line,
-                before,
-                after,
-                content_buffer: buffer,
-            };
-            let mut rec = Record::fallback(
-                command_name,
-                target,
-                window,
-                "Semantic extraction not yet available; returning raw text window.",
-            );
-            rec.truncated = result.truncated;
-            rec
-        };
+        let record = resolve_one(command_name, target, query, &result, &engine, cli);
         writer.write(&record)?;
     }
 
     writer.finish()?;
     Ok(())
+}
+
+/// Apply the degradation ladder to one target's candidate set.
+fn resolve_one(
+    command: &str,
+    target: &str,
+    query: Query,
+    result: &FinderResult,
+    engine: &SyntacticEngine,
+    cli: &Cli,
+) -> Record {
+    if result.candidates.is_empty() {
+        return Record::not_found(command, target);
+    }
+
+    // find-refs does not parse for boundaries in v1 (Phase 5); emit a window.
+    if query == Query::References {
+        return text_fallback(command, target, result, cli);
+    }
+
+    let resolutions = match query {
+        Query::Definition => engine.definitions(target, &result.candidates),
+        Query::Declaration => engine.declarations(target, &result.candidates),
+        Query::References => unreachable!(),
+    };
+
+    match resolutions.len() {
+        0 => text_fallback(command, target, result, cli),
+        1 => {
+            let r = &resolutions[0];
+            let rtype = resolution_type(query, r.symbol.kind);
+            let mut rec = Record::resolved(command, target, &rtype, r);
+            rec.truncated = result.truncated;
+            rec
+        }
+        _ => {
+            let candidates = resolutions.iter().map(to_candidate).collect();
+            let mut rec = Record::ambiguous(command, target, candidates);
+            rec.truncated = result.truncated;
+            rec
+        }
+    }
+}
+
+/// Build the `resolution_type` string for a resolved record.
+fn resolution_type(query: Query, kind: Kind) -> String {
+    match query {
+        Query::Declaration => "declaration".to_string(),
+        Query::Definition => match kind {
+            Kind::Function | Kind::Method => "function_definition".to_string(),
+            Kind::Variable | Kind::Member => "variable_definition".to_string(),
+            Kind::Template => "template_definition".to_string(),
+            Kind::Class => "class_definition".to_string(),
+            Kind::Struct => "struct_definition".to_string(),
+            Kind::Macro => "macro_definition".to_string(),
+        },
+        Query::References => "reference".to_string(),
+    }
+}
+
+/// Map a resolution to an ambiguous-candidate location (design-specs §8.5).
+fn to_candidate(r: &Resolution) -> output::Candidate {
+    let snippet = String::from_utf8_lossy(&r.content_bytes)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    output::Candidate {
+        file_path: r.source_ref.file_path.to_string_lossy().into_owned(),
+        line: r.source_ref.span.start_line,
+        snippet: Some(snippet),
+    }
+}
+
+/// Degrade to a verbatim ±window text buffer around the first textual hit
+/// (design-specs §8.6).
+fn text_fallback(command: &str, target: &str, result: &FinderResult, cli: &Cli) -> Record {
+    let hit = &result.candidates[0];
+    let (buffer, before, after) =
+        read_window(&hit.file_path, hit.line, cli.window).unwrap_or_else(|_| (hit.snippet.clone(), 0, 0));
+    let window = TextWindow {
+        file_path: hit.file_path.to_string_lossy().into_owned(),
+        approximate_line: hit.line,
+        before,
+        after,
+        content_buffer: buffer,
+    };
+    let msg = match command {
+        "find-refs" => "Reference locations as a raw text window.",
+        _ => "Semantic extraction unavailable for this target; returning raw text window.",
+    };
+    let mut rec = Record::fallback(command, target, window, msg);
+    rec.truncated = result.truncated;
+    rec
 }
 
 /// Translate CLI globals into a [`FinderConfig`] (design-specs §12).
@@ -128,5 +211,12 @@ mod tests {
         assert_eq!(before, 1);
         assert_eq!(after, 1);
         assert_eq!(buf, "l2\nl3\nl4");
+    }
+
+    #[test]
+    fn def_resolution_type_by_kind() {
+        assert_eq!(resolution_type(Query::Definition, Kind::Function), "function_definition");
+        assert_eq!(resolution_type(Query::Definition, Kind::Template), "template_definition");
+        assert_eq!(resolution_type(Query::Declaration, Kind::Function), "declaration");
     }
 }

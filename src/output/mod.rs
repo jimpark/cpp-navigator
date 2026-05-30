@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use serde::Serialize;
 
 use crate::cli::Format;
+use crate::model::{Kind, Resolution};
 
 pub const SCHEMA_VERSION: &str = "1.0";
 pub const TOOL: &str = "cpp-navigator";
@@ -129,6 +130,37 @@ impl Record {
         let mut r = Record::new(command, target, Status::NotFound, "not_found");
         r.message = Some("No textual or semantic match in the searched roots.".to_string());
         r
+    }
+
+    /// The `resolved` rung: an engine bounded the target to one exact construct
+    /// (design-specs §8.3). `content` is the verbatim byte slice. For `find-decl`
+    /// the signature/type/doc fields are populated from the symbol.
+    pub fn resolved(command: &str, target: &str, resolution_type: &str, r: &Resolution) -> Self {
+        let mut rec = Record::new(command, target, Status::Resolved, resolution_type);
+        let span = &r.source_ref.span;
+        rec.engine = Some(r.engine.clone());
+        rec.file_path = Some(r.source_ref.file_path.to_string_lossy().into_owned());
+        rec.start_line = Some(span.start_line);
+        rec.end_line = Some(span.end_line);
+        rec.start_byte = Some(span.start_byte);
+        rec.end_byte = Some(span.end_byte);
+        rec.content = Some(String::from_utf8_lossy(&r.content_bytes).into_owned());
+        rec.signature = r.symbol.signature.clone();
+        rec.type_spelling = r.symbol.type_spelling.clone();
+        rec.doc = r.symbol.doc.clone();
+        rec
+    }
+
+    /// The `ambiguous` rung: an engine found multiple matches (overloads /
+    /// redefinitions) and cannot pick one syntactically (design-specs §8.5).
+    pub fn ambiguous(command: &str, target: &str, candidates: Vec<Candidate>) -> Self {
+        let mut rec = Record::new(command, target, Status::Ambiguous, "ambiguous_multiple_matches");
+        rec.message = Some(format!(
+            "Found {} candidates. Returning raw candidate locations.",
+            candidates.len()
+        ));
+        rec.candidates = candidates;
+        rec
     }
 
     /// The text-fallback rung: a match was found textually but no engine could

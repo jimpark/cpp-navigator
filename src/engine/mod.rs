@@ -10,6 +10,9 @@ use std::path::Path;
 use crate::model::{Resolution, Span};
 use crate::search::Candidate;
 
+mod syntactic;
+pub use syntactic::SyntacticEngine;
+
 /// Common interface over the syntactic and semantic backends.
 pub trait Engine {
     /// Human/log name, e.g. `"tree-sitter"` or `"libclang"`.
