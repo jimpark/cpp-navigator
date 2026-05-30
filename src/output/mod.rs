@@ -130,6 +130,37 @@ impl Record {
         r.message = Some("No textual or semantic match in the searched roots.".to_string());
         r
     }
+
+    /// The text-fallback rung: a match was found textually but no engine could
+    /// bound it to an exact construct (design-specs §8.6). `content_buffer` is a
+    /// verbatim window of lines around the hit.
+    pub fn fallback(
+        command: &str,
+        target: &str,
+        window: TextWindow,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut r = Record::new(command, target, Status::Fallback, "partial_resolution_fallback");
+        r.file_path = Some(window.file_path);
+        r.approximate_line = Some(window.approximate_line);
+        r.window_before = Some(window.before);
+        r.window_after = Some(window.after);
+        r.content_buffer = Some(window.content_buffer);
+        r.message = Some(message.into());
+        r
+    }
+}
+
+/// A verbatim line-window around a textual hit, for the `fallback` rung
+/// (design-specs §8.6). `before`/`after` are the actual line counts retained,
+/// which can be smaller than the requested window near a file edge.
+#[derive(Clone, Debug)]
+pub struct TextWindow {
+    pub file_path: String,
+    pub approximate_line: usize,
+    pub before: usize,
+    pub after: usize,
+    pub content_buffer: String,
 }
 
 /// Streams records to a sink in the selected [`Format`].
