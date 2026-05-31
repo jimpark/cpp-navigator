@@ -316,29 +316,46 @@ pub struct Writer<W: Write> {
     out: W,
     format: Format,
     legend: bool,
+    /// Emit ANSI color escapes in human mode (true only when stdout is a TTY).
+    colors: bool,
+    /// Count of records written, used to insert separators in human mode.
+    record_count: usize,
     /// Buffered records for bundle mode (jsonl streams directly).
     buffered: Vec<String>,
 }
 
 impl<W: Write> Writer<W> {
-    pub fn new(out: W, format: Format, legend: bool) -> Self {
+    pub fn new(out: W, format: Format, legend: bool, colors: bool) -> Self {
         Writer {
             out,
             format,
             legend,
+            colors,
+            record_count: 0,
             buffered: Vec::new(),
         }
     }
 
     /// Emit a record (or buffer it, in bundle mode).
     pub fn write(&mut self, record: &Record) -> io::Result<()> {
-        let line = serde_json::to_string(record)?;
         match self.format {
             Format::Jsonl => {
+                let line = serde_json::to_string(record)?;
                 self.out.write_all(line.as_bytes())?;
                 self.out.write_all(b"\n")?;
             }
-            Format::Bundle => self.buffered.push(line),
+            Format::Bundle => {
+                let line = serde_json::to_string(record)?;
+                self.buffered.push(line);
+            }
+            Format::Human => {
+                if self.record_count > 0 {
+                    self.out.write_all(b"\n")?;
+                }
+                let rendered = render_human(record, self.colors);
+                self.out.write_all(rendered.as_bytes())?;
+                self.record_count += 1;
+            }
         }
         Ok(())
     }
@@ -364,6 +381,152 @@ impl<W: Write> Writer<W> {
         }
         self.out.flush()
     }
+}
+
+/// Render a [`Record`] as human-readable text.
+///
+/// When `colors` is true, ANSI escape codes are emitted for bold/color
+/// highlights. When false, the output is plain text suitable for piping.
+fn render_human(record: &Record, colors: bool) -> String {
+    let bold   = |s: &str| if colors { format!("\x1b[1m{s}\x1b[0m")    } else { s.to_string() };
+    let green  = |s: &str| if colors { format!("\x1b[32;1m{s}\x1b[0m") } else { s.to_string() };
+    let yellow = |s: &str| if colors { format!("\x1b[33;1m{s}\x1b[0m") } else { s.to_string() };
+    let red    = |s: &str| if colors { format!("\x1b[31;1m{s}\x1b[0m") } else { s.to_string() };
+    let dim    = |s: &str| if colors { format!("\x1b[2m{s}\x1b[0m")    } else { s.to_string() };
+    let cyan   = |s: &str| if colors { format!("\x1b[36m{s}\x1b[0m")   } else { s.to_string() };
+
+    let mut out = String::new();
+
+    // Header line: "find-def: MySymbol  RESOLVED (function_definition)  via tree-sitter"
+    let cmd_target = format!("{}: {}", record.command, record.target);
+    let status_tag = match record.status {
+        Status::Resolved  => green("RESOLVED"),
+        Status::Ambiguous => yellow("AMBIGUOUS"),
+        Status::Fallback  => yellow("FALLBACK"),
+        Status::NotFound  => red("NOT FOUND"),
+    };
+    let rtype = dim(&format!("({})", record.resolution_type));
+    let engine_suffix = match &record.engine {
+        Some(e) => format!("  {}", dim(&format!("via {e}"))),
+        None    => String::new(),
+    };
+    out += &format!("{}  {} {}{}\n", bold(&cmd_target), status_tag, rtype, engine_suffix);
+
+    match record.status {
+        Status::Resolved => {
+            if !record.results.is_empty() {
+                // Multi-resolved: overloads shown in full.
+                if let Some(msg) = &record.message {
+                    out += &format!("{}\n", dim(msg));
+                }
+                for (i, r) in record.results.iter().enumerate() {
+                    let loc = format!("{}:{}-{}", r.file_path, r.start_line, r.end_line);
+                    out += &format!("\n[{}] {}\n", i + 1, cyan(&loc));
+                    if let Some(sig) = &r.signature {
+                        out += &format!("    {}\n", dim(sig));
+                    }
+                    out += "\n";
+                    for line in r.content.lines() {
+                        out += &format!("    {line}\n");
+                    }
+                }
+            } else if !record.contexts.is_empty() {
+                // find-refs --context: reference + enclosing scope body.
+                if let Some(msg) = &record.message {
+                    out += &format!("{}\n", dim(msg));
+                }
+                for ctx in &record.contexts {
+                    let loc = format!("{}:{}", ctx.file, ctx.line);
+                    let scope = format!("scope lines {}-{}", ctx.scope_start_line, ctx.scope_end_line);
+                    out += &format!("\n{}  {}\n\n", cyan(&loc), dim(&scope));
+                    for line in ctx.content.lines() {
+                        out += &format!("    {line}\n");
+                    }
+                }
+                if record.truncated {
+                    out += &format!("{}\n", dim("(truncated — more results omitted)"));
+                }
+            } else if !record.locations.is_empty() {
+                // find-refs location-only: dense file:line list.
+                if let Some(msg) = &record.message {
+                    out += &format!("{}\n", dim(msg));
+                }
+                for loc in &record.locations {
+                    out += &format!("  {}:{}\n", cyan(&loc.file), loc.line);
+                }
+                if record.truncated {
+                    out += &format!("  {}\n", dim("(truncated — more results omitted)"));
+                }
+            } else if let Some(file) = &record.file_path {
+                // Single resolved definition or declaration.
+                let loc = format!(
+                    "{}:{}-{}",
+                    file,
+                    record.start_line.unwrap_or(0),
+                    record.end_line.unwrap_or(0),
+                );
+                out += &format!("{}\n", cyan(&loc));
+                if let Some(sig) = &record.signature {
+                    out += &format!("Signature: {sig}\n");
+                }
+                if let Some(doc) = &record.doc {
+                    for line in doc.lines() {
+                        out += &format!("{}\n", dim(line));
+                    }
+                }
+                out += "\n";
+                if let Some(content) = &record.content {
+                    for line in content.lines() {
+                        out += &format!("    {line}\n");
+                    }
+                }
+                if record.truncated {
+                    out += &format!("{}\n", dim("(truncated)"));
+                }
+                if let Some(msg) = &record.message {
+                    out += &format!("{}\n", dim(msg));
+                }
+            }
+        }
+        Status::Ambiguous => {
+            if let Some(msg) = &record.message {
+                out += &format!("{}\n", dim(msg));
+            }
+            for cand in &record.candidates {
+                let loc = format!("{}:{}", cand.file_path, cand.line);
+                match &cand.snippet {
+                    Some(s) => out += &format!("  {}  {}\n", cyan(&loc), dim(s)),
+                    None    => out += &format!("  {}\n", cyan(&loc)),
+                }
+            }
+        }
+        Status::Fallback => {
+            if let (Some(file), Some(approx)) = (&record.file_path, record.approximate_line) {
+                let loc = format!("{file}  ~line {approx}");
+                out += &format!("{}\n", cyan(&loc));
+            }
+            if let Some(msg) = &record.message {
+                out += &format!("{}\n", dim(msg));
+            }
+            if let Some(buf) = &record.content_buffer {
+                out += "\n";
+                for line in buf.lines() {
+                    out += &format!("    {line}\n");
+                }
+            }
+        }
+        Status::NotFound => {
+            if let Some(msg) = &record.message {
+                out += &format!("{msg}\n");
+            }
+        }
+    }
+
+    if record.budget_trimmed {
+        out += &format!("{}\n", dim("(budget trimmed)"));
+    }
+
+    out
 }
 
 /// Estimate token count from byte length.
@@ -515,7 +678,7 @@ mod tests {
     fn bundle_writer_emits_token_count() {
         let mut buf = Vec::new();
         {
-            let mut w = Writer::new(&mut buf, Format::Bundle, false);
+            let mut w = Writer::new(&mut buf, Format::Bundle, false, false);
             let rec = Record::not_found("find-def", "foo");
             w.write(&rec).unwrap();
             w.finish().unwrap();
@@ -530,7 +693,7 @@ mod tests {
     fn bundle_writer_with_legend() {
         let mut buf = Vec::new();
         {
-            let mut w = Writer::new(&mut buf, Format::Bundle, true);
+            let mut w = Writer::new(&mut buf, Format::Bundle, true, false);
             let rec = Record::not_found("find-def", "foo");
             w.write(&rec).unwrap();
             w.finish().unwrap();

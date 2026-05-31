@@ -97,8 +97,10 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
         records = output::apply_budget(records, budget);
     }
 
+    use std::io::IsTerminal as _;
     let stdout = std::io::stdout();
-    let mut writer = Writer::new(stdout.lock(), cli.format, cli.legend);
+    let colors = cli.format == crate::cli::Format::Human && stdout.is_terminal();
+    let mut writer = Writer::new(stdout.lock(), cli.format, cli.legend, colors);
     for record in &records {
         writer.write(record)?;
     }

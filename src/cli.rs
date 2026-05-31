@@ -20,6 +20,8 @@ pub enum Format {
     Jsonl,
     /// A single fenced block for a human to paste into a chat.
     Bundle,
+    /// Human-readable text for terminal use; uses ANSI color when stdout is a TTY.
+    Human,
 }
 
 #[derive(Parser, Debug)]
