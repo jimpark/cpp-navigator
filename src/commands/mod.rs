@@ -1,10 +1,12 @@
 //! Per-command pipelines (design-specs §7).
 //!
-//! Phase 2 wires the syntactic engine (Stage 1) into `find-def`/`find-decl`.
-//! Each target runs the degradation ladder (design-specs §9):
-//!   engine resolves 1 → `resolved`; >1 → `ambiguous`; 0 (but text hits) →
-//!   `fallback` text window; 0 text hits → `not_found`.
-//! `find-refs` keeps the Phase 1 location/window behavior until Phase 5.
+//! Phase 5 implements find-refs (location-only and --context). Each target
+//! runs the degradation ladder (design-specs §9):
+//!
+//! - engine resolves 1 → `resolved`; >1 (within max) → `multi_resolved`;
+//!   >max → `ambiguous`; 0-but-text → `fallback`; 0 → `not_found`.
+//! - find-refs emits a dense location list by default, or enclosing-scope
+//!   context with `--context`.
 
 use std::path::PathBuf;
 
@@ -13,7 +15,7 @@ use anyhow::Result;
 use crate::cli::{Cli, Command};
 use crate::engine::{Engine, SyntacticEngine};
 use crate::model::{Kind, Resolution};
-use crate::output::{self, Record, TextWindow, Writer};
+use crate::output::{self, Record, RefContext, RefLocation, TextWindow, Writer};
 use crate::search::{self, FinderConfig, FinderResult, DEFAULT_EXTENSIONS};
 
 /// Which resolution a command asks the engine for.
@@ -27,10 +29,10 @@ enum Query {
 
 /// Run the selected command, writing records to stdout.
 pub fn dispatch(cli: &Cli) -> Result<()> {
-    let (command_name, targets, query, scope) = match &cli.command {
-        Command::FindDef { name, scope } => ("find-def", name, Query::Definition, *scope),
-        Command::FindDecl { name } => ("find-decl", name, Query::Declaration, false),
-        Command::FindRefs { name, .. } => ("find-refs", name, Query::References, false),
+    let (command_name, targets, query, scope, context) = match &cli.command {
+        Command::FindDef { name, scope } => ("find-def", name, Query::Definition, *scope, false),
+        Command::FindDecl { name } => ("find-decl", name, Query::Declaration, false, false),
+        Command::FindRefs { name, context } => ("find-refs", name, Query::References, false, *context),
     };
 
     let mut finder_cfg = build_finder_config(cli);
@@ -43,7 +45,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
 
     for target in targets {
         let result = search::find_candidates(target, &finder_cfg)?;
-        let record = resolve_one(command_name, target, query, scope, &result, &engine, cli);
+        let record = resolve_one(command_name, target, query, scope, context, &result, &engine, cli);
         writer.write(&record)?;
     }
 
@@ -52,11 +54,13 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
 }
 
 /// Apply the degradation ladder to one target's candidate set.
+#[allow(clippy::too_many_arguments)]
 fn resolve_one(
     command: &str,
     target: &str,
     query: Query,
     scope: bool,
+    context: bool,
     result: &FinderResult,
     engine: &SyntacticEngine,
     cli: &Cli,
@@ -65,9 +69,9 @@ fn resolve_one(
         return Record::not_found(command, target);
     }
 
-    // find-refs does not parse for boundaries in v1 (Phase 5); emit a window.
+    // find-refs: emit dense location list or contextual bodies.
     if query == Query::References {
-        return text_fallback(command, target, result, cli);
+        return resolve_refs(command, target, context, result, engine, cli);
     }
 
     let resolutions = match query {
@@ -81,9 +85,6 @@ fn resolve_one(
         1 => {
             let base = &resolutions[0];
             let rtype = resolution_type(query, base.symbol.kind);
-            // `--scope` (find-def): widen a resolved member to its enclosing
-            // class/struct. Graceful no-op when the match is not inside one
-            // (free function, out-of-line member) — design §7.1 step 3.
             let expanded = if scope && query == Query::Definition {
                 expand_to_class_scope(engine, base)
             } else {
@@ -101,13 +102,92 @@ fn resolve_one(
             rec.truncated = result.truncated;
             rec
         }
-        _ => {
+        n if n <= cli.max_results => {
+            // Show all matches with full content (user-preferred behavior for overloads).
+            let rtype = resolution_type(query, resolutions[0].symbol.kind);
+            let mut rec = Record::multi_resolved(command, target, &rtype, &resolutions, n);
+            rec.truncated = result.truncated;
+            rec
+        }
+        n => {
+            // Too many matches — fall back to ambiguous with locations only.
             let candidates = resolutions.iter().map(to_candidate).collect();
             let mut rec = Record::ambiguous(command, target, candidates);
+            rec.message = Some(format!(
+                "Found {} candidates (exceeds --max-results {}). Returning locations only.",
+                n, cli.max_results
+            ));
             rec.truncated = result.truncated;
             rec
         }
     }
+}
+
+/// Resolve find-refs: location-only or with enclosing-scope context.
+fn resolve_refs(
+    command: &str,
+    target: &str,
+    context: bool,
+    result: &FinderResult,
+    engine: &SyntacticEngine,
+    cli: &Cli,
+) -> Record {
+    if context {
+        // --context: for each hit, find the enclosing function/template body.
+        let mut seen = std::collections::HashSet::new();
+        let mut contexts = Vec::new();
+        for hit in &result.candidates {
+            if let Some(span) = engine.enclosing_scope(&hit.file_path, hit.byte_offset) {
+                // Deduplicate by (file, scope start byte) — multiple refs in the
+                // same function body should produce only one context entry.
+                let key = (hit.file_path.clone(), span.start_byte);
+                if !seen.insert(key) {
+                    continue;
+                }
+                let content = match std::fs::read(&hit.file_path) {
+                    Ok(src) if span.end_byte <= src.len() => {
+                        String::from_utf8_lossy(&src[span.start_byte..span.end_byte]).into_owned()
+                    }
+                    _ => continue,
+                };
+                contexts.push(RefContext {
+                    file: hit.file_path.to_string_lossy().into_owned(),
+                    line: hit.line,
+                    scope_start_line: span.start_line,
+                    scope_end_line: span.end_line,
+                    content,
+                });
+                if contexts.len() >= cli.max_candidates {
+                    break;
+                }
+            }
+        }
+        if contexts.is_empty() {
+            // No enclosing scope found for any hit — degrade to location-only.
+            return resolve_refs_locations(command, target, result);
+        }
+        let truncated = result.truncated || contexts.len() >= cli.max_candidates;
+        Record::references_with_context(command, target, contexts, truncated)
+    } else {
+        resolve_refs_locations(command, target, result)
+    }
+}
+
+/// Emit a dense location list for find-refs (default, no --context).
+fn resolve_refs_locations(command: &str, target: &str, result: &FinderResult) -> Record {
+    // Deduplicate by (file, line) — a single line can have multiple textual
+    // matches but we report it once.
+    let mut seen = std::collections::HashSet::new();
+    let locations: Vec<RefLocation> = result
+        .candidates
+        .iter()
+        .filter(|c| seen.insert((c.file_path.clone(), c.line)))
+        .map(|c| RefLocation {
+            file: c.file_path.to_string_lossy().into_owned(),
+            line: c.line,
+        })
+        .collect();
+    Record::references(command, target, locations, result.truncated)
 }
 
 /// Build the `resolution_type` string for a resolved record.
@@ -268,6 +348,18 @@ mod tests {
         }]
     }
 
+    fn candidates_at(p: &std::path::Path, offsets: &[(usize, usize)]) -> Vec<Candidate> {
+        offsets
+            .iter()
+            .map(|&(line, byte_offset)| Candidate {
+                file_path: p.to_path_buf(),
+                line,
+                byte_offset,
+                snippet: String::new(),
+            })
+            .collect()
+    }
+
     #[test]
     fn scope_expands_inline_member_with_byte_fidelity() {
         let dir = TempDir::new().unwrap();
@@ -278,16 +370,13 @@ mod tests {
 
         let defs = eng.definitions("area", &one_candidate(&p));
         assert_eq!(defs.len(), 1);
-        // Without scope, the member span is just the method.
         let member = &defs[0];
         assert!(String::from_utf8_lossy(&member.content_bytes).starts_with("int area()"));
 
-        // With scope, expand to the whole class.
         let expanded = expand_to_class_scope(&eng, member).unwrap();
         let s = String::from_utf8_lossy(&expanded.content_bytes);
         assert!(s.starts_with("class Widget {"));
         assert!(s.trim_end().ends_with('}'));
-        // Byte-fidelity: re-slice from disk equals reported content (§8.4).
         let disk = fs::read(&p).unwrap();
         let span = &expanded.source_ref.span;
         assert_eq!(&disk[span.start_byte..span.end_byte], expanded.content_bytes.as_slice());
@@ -301,7 +390,334 @@ mod tests {
         let eng = SyntacticEngine::new();
         let defs = eng.definitions("add", &one_candidate(&p));
         assert_eq!(defs.len(), 1);
-        // No enclosing class → no expansion.
         assert!(expand_to_class_scope(&eng, &defs[0]).is_none());
+    }
+
+    // --- Phase 5: find-refs tests ---
+
+    #[test]
+    fn refs_location_only_returns_dense_list() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        let body = "void foo() {}\nvoid bar() { foo(); }\nvoid baz() { foo(); }\n";
+        fs::write(&p, body).unwrap();
+
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("foo", &finder_cfg).unwrap();
+        // foo appears on lines 1 (def), 2 (call), 3 (call)
+        assert!(result.candidates.len() >= 3);
+
+        let record = resolve_refs_locations("find-refs", "foo", &result);
+        assert_eq!(record.status, output::Status::Resolved);
+        assert_eq!(record.resolution_type, "references");
+        assert!(record.locations.len() >= 3);
+        assert!(!record.truncated);
+    }
+
+    #[test]
+    fn refs_deduplicates_same_line() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        // Two mentions of `x` on the same line
+        let body = "int x = 1;\nvoid f() { x = x + 1; }\n";
+        fs::write(&p, body).unwrap();
+
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("x", &finder_cfg).unwrap();
+        let record = resolve_refs_locations("find-refs", "x", &result);
+        // Line 1 has one mention, line 2 has two mentions (deduplicated to one).
+        assert_eq!(record.locations.len(), 2);
+    }
+
+    #[test]
+    fn refs_context_returns_enclosing_function() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        let body = concat!(
+            "int helper() { return 42; }\n",
+            "void caller1() {\n",
+            "    int v = helper();\n",
+            "}\n",
+            "void caller2() {\n",
+            "    helper();\n",
+            "}\n",
+        );
+        fs::write(&p, body).unwrap();
+
+        let eng = SyntacticEngine::new();
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("helper", &finder_cfg).unwrap();
+
+        // Use resolve_refs with context=true
+        let cli = Cli {
+            command: Command::FindRefs { name: vec!["helper".into()], context: true },
+            root: vec![dir.path().to_path_buf()],
+            semantic: false,
+            compile_db: None,
+            lang: vec![],
+            max_candidates: 200,
+            max_results: 3,
+            window: 10,
+            jobs: None,
+            no_ignore: false,
+            format: crate::cli::Format::Jsonl,
+            legend: false,
+            manifest: None,
+            budget: None,
+            quiet: false,
+        };
+        let record = resolve_refs("find-refs", "helper", true, &result, &eng, &cli);
+        assert_eq!(record.resolution_type, "references_with_context");
+        // Should have contexts for: helper() def, caller1, caller2
+        // but deduped by enclosing scope, so at most 3 distinct scopes.
+        assert!(record.contexts.len() >= 2);
+        // Each context should contain the function body.
+        for ctx in &record.contexts {
+            assert!(!ctx.content.is_empty());
+            assert!(ctx.scope_start_line > 0);
+        }
+    }
+
+    #[test]
+    fn refs_context_deduplicates_same_scope() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        // Multiple references to `val` in the same function
+        let body = "void work() {\n    int val = 1;\n    val++;\n    val *= 2;\n}\n";
+        fs::write(&p, body).unwrap();
+
+        let eng = SyntacticEngine::new();
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("val", &finder_cfg).unwrap();
+        assert!(result.candidates.len() >= 3); // val appears 3 times
+
+        let cli = Cli {
+            command: Command::FindRefs { name: vec!["val".into()], context: true },
+            root: vec![dir.path().to_path_buf()],
+            semantic: false,
+            compile_db: None,
+            lang: vec![],
+            max_candidates: 200,
+            max_results: 3,
+            window: 10,
+            jobs: None,
+            no_ignore: false,
+            format: crate::cli::Format::Jsonl,
+            legend: false,
+            manifest: None,
+            budget: None,
+            quiet: false,
+        };
+        let record = resolve_refs("find-refs", "val", true, &result, &eng, &cli);
+        // All refs in the same function → deduplicated to one context entry.
+        assert_eq!(record.contexts.len(), 1);
+        assert!(record.contexts[0].content.contains("int val = 1;"));
+    }
+
+    #[test]
+    fn refs_across_multiple_files() {
+        let dir = TempDir::new().unwrap();
+        let p1 = dir.path().join("a.cpp");
+        let p2 = dir.path().join("b.cpp");
+        fs::write(&p1, "void target() {}\n").unwrap();
+        fs::write(&p2, "extern void target();\nvoid use() { target(); }\n").unwrap();
+
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("target", &finder_cfg).unwrap();
+        let record = resolve_refs_locations("find-refs", "target", &result);
+        // At least 3 locations: def in a.cpp, decl in b.cpp, call in b.cpp
+        assert!(record.locations.len() >= 3);
+        // Files should be ordered deterministically.
+        let files: Vec<&str> = record.locations.iter().map(|l| l.file.as_str()).collect();
+        let mut sorted = files.clone();
+        sorted.sort();
+        assert_eq!(files, sorted);
+    }
+
+    // --- Phase 5: multi-resolved (overload show-all) tests ---
+
+    #[test]
+    fn overloads_within_max_results_show_full_content() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        let body = "void process(int x) { x++; }\nvoid process(double y) { y *= 2; }\n";
+        fs::write(&p, body).unwrap();
+
+        let eng = SyntacticEngine::new();
+        let candidates = one_candidate(&p);
+        let resolutions = eng.definitions("process", &candidates);
+        assert_eq!(resolutions.len(), 2);
+
+        // With max_results=3, both should be shown in full.
+        let record = Record::multi_resolved(
+            "find-def", "process", "function_definition", &resolutions, 2,
+        );
+        assert_eq!(record.status, output::Status::Resolved);
+        assert_eq!(record.results.len(), 2);
+        assert!(record.results[0].content.contains("x++"));
+        assert!(record.results[1].content.contains("y *= 2"));
+    }
+
+    #[test]
+    fn overloads_exceeding_max_results_show_ambiguous() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        let body = concat!(
+            "void f(int a) {}\n",
+            "void f(double a) {}\n",
+            "void f(char a) {}\n",
+            "void f(long a) {}\n",
+        );
+        fs::write(&p, body).unwrap();
+
+        let eng = SyntacticEngine::new();
+        let candidates = one_candidate(&p);
+        let resolutions = eng.definitions("f", &candidates);
+        assert_eq!(resolutions.len(), 4);
+
+        // Simulate what resolve_one does with max_results=3
+        let max_results = 3;
+        let n = resolutions.len();
+        assert!(n > max_results);
+        let candidates_out: Vec<output::Candidate> = resolutions.iter().map(to_candidate).collect();
+        let record = Record::ambiguous("find-def", "f", candidates_out);
+        assert_eq!(record.status, output::Status::Ambiguous);
+        assert_eq!(record.candidates.len(), 4);
+    }
+
+    // --- Regression tests inspired by mepsplatform patterns ---
+
+    #[test]
+    fn refs_finds_method_calls_through_pointer() {
+        // Pattern from mepsplatform: m_pEdit->GetWindowText(str)
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("dlg.cpp");
+        let body = concat!(
+            "class CDialog {\n",
+            "public:\n",
+            "    void GetWindowText(CString& s);\n",
+            "};\n",
+            "void OnOK() {\n",
+            "    CString str;\n",
+            "    m_pEdit->GetWindowText(str);\n",
+            "}\n",
+            "void OnChange() {\n",
+            "    CString s;\n",
+            "    m_pEdit->GetWindowText(s);\n",
+            "    m_label.GetWindowText(s);\n",
+            "}\n",
+        );
+        fs::write(&p, body).unwrap();
+
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("GetWindowText", &finder_cfg).unwrap();
+        let record = resolve_refs_locations("find-refs", "GetWindowText", &result);
+        // Should find all 4 mentions: declaration + 3 calls
+        assert_eq!(record.locations.len(), 4);
+    }
+
+    #[test]
+    fn refs_context_finds_method_in_class_member_function() {
+        // Pattern from mepsplatform: OnCreate defined as CMainFrame::OnCreate
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("frame.cpp");
+        let body = concat!(
+            "int CMainFrame::OnCreate(LPCREATESTRUCT lp) {\n",
+            "    if (CFrameWnd::OnCreate(lp) == -1)\n",
+            "        return -1;\n",
+            "    return 0;\n",
+            "}\n",
+            "int CChildView::OnCreate(LPCREATESTRUCT lp) {\n",
+            "    OnCreate(lp);\n",
+            "    return 0;\n",
+            "}\n",
+        );
+        fs::write(&p, body).unwrap();
+
+        let eng = SyntacticEngine::new();
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("OnCreate", &finder_cfg).unwrap();
+        assert!(result.candidates.len() >= 4); // multiple mentions
+
+        let cli = Cli {
+            command: Command::FindRefs { name: vec!["OnCreate".into()], context: true },
+            root: vec![dir.path().to_path_buf()],
+            semantic: false,
+            compile_db: None,
+            lang: vec![],
+            max_candidates: 200,
+            max_results: 3,
+            window: 10,
+            jobs: None,
+            no_ignore: false,
+            format: crate::cli::Format::Jsonl,
+            legend: false,
+            manifest: None,
+            budget: None,
+            quiet: false,
+        };
+        let record = resolve_refs("find-refs", "OnCreate", true, &result, &eng, &cli);
+        assert_eq!(record.resolution_type, "references_with_context");
+        // Should deduplicate to 2 distinct function scopes.
+        assert_eq!(record.contexts.len(), 2);
+    }
+
+    #[test]
+    fn find_def_qualified_shows_specific_overload() {
+        // Pattern: CMainFrame::OnCreate vs CChildView::OnCreate
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("frame.cpp");
+        let body = concat!(
+            "int CMainFrame::OnCreate(LPCREATESTRUCT lp) {\n",
+            "    return 0;\n",
+            "}\n",
+            "int CChildView::OnCreate(LPCREATESTRUCT lp) {\n",
+            "    return 0;\n",
+            "}\n",
+        );
+        fs::write(&p, body).unwrap();
+
+        let eng = SyntacticEngine::new();
+        let candidates = one_candidate(&p);
+        // Qualified name narrows to one.
+        let res = eng.definitions("CMainFrame::OnCreate", &candidates);
+        assert_eq!(res.len(), 1);
+        assert!(String::from_utf8_lossy(&res[0].content_bytes).contains("CMainFrame::OnCreate"));
+    }
+
+    #[test]
+    fn refs_not_found_for_missing_symbol() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        fs::write(&p, "void other() {}\n").unwrap();
+
+        let result = FinderResult {
+            candidates: vec![],
+            truncated: false,
+        };
+        let record = resolve_refs_locations("find-refs", "missing", &result);
+        // Empty locations is valid — caller should check not_found first.
+        assert!(record.locations.is_empty());
     }
 }

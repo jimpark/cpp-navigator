@@ -16,7 +16,7 @@ pub const SCHEMA_VERSION: &str = "1.0";
 pub const TOOL: &str = "cpp-navigator";
 
 /// Wire-level status (snake_case on the wire to match `resolution_type`).
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Resolved,
@@ -32,6 +32,42 @@ pub struct Candidate {
     pub line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+}
+
+/// A dense reference location (file + line) for find-refs location-only mode.
+#[derive(Clone, Debug, Serialize)]
+pub struct RefLocation {
+    pub file: String,
+    pub line: usize,
+}
+
+/// A full resolved result record emitted when showing multiple overloads.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResolvedResult {
+    pub file_path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_spelling: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+}
+
+/// A reference with its enclosing scope context (for --context mode).
+#[derive(Clone, Debug, Serialize)]
+pub struct RefContext {
+    pub file: String,
+    pub line: usize,
+    pub scope_start_line: usize,
+    pub scope_end_line: usize,
+    pub content: String,
 }
 
 /// A single output record. The envelope fields are always present; everything
@@ -75,6 +111,18 @@ pub struct Record {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<Candidate>,
 
+    // Multiple resolved results (overloads shown in full) -----------------
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<ResolvedResult>,
+
+    // find-refs location-only ---------------------------------------------
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<RefLocation>,
+
+    // find-refs --context -------------------------------------------------
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<RefContext>,
+
     // Fallback ------------------------------------------------------------
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approximate_line: Option<usize>,
@@ -115,6 +163,9 @@ impl Record {
             type_spelling: None,
             doc: None,
             candidates: Vec::new(),
+            results: Vec::new(),
+            locations: Vec::new(),
+            contexts: Vec::new(),
             approximate_line: None,
             window_before: None,
             window_after: None,
@@ -180,6 +231,71 @@ impl Record {
         r.content_buffer = Some(window.content_buffer);
         r.message = Some(message.into());
         r
+    }
+
+    /// Multiple resolved results (overloads shown with full content).
+    pub fn multi_resolved(
+        command: &str,
+        target: &str,
+        resolution_type: &str,
+        resolutions: &[Resolution],
+        total: usize,
+    ) -> Self {
+        let mut rec = Record::new(command, target, Status::Resolved, resolution_type);
+        rec.engine = Some(resolutions[0].engine.clone());
+        let results: Vec<ResolvedResult> = resolutions
+            .iter()
+            .map(|r| ResolvedResult {
+                file_path: r.source_ref.file_path.to_string_lossy().into_owned(),
+                start_line: r.source_ref.span.start_line,
+                end_line: r.source_ref.span.end_line,
+                start_byte: r.source_ref.span.start_byte,
+                end_byte: r.source_ref.span.end_byte,
+                content: String::from_utf8_lossy(&r.content_bytes).into_owned(),
+                signature: r.symbol.signature.clone(),
+                type_spelling: r.symbol.type_spelling.clone(),
+                doc: r.symbol.doc.clone(),
+                qualified_name: r.symbol.qualified_name.clone(),
+            })
+            .collect();
+        let shown = results.len();
+        rec.results = results;
+        if total > shown {
+            rec.message = Some(format!(
+                "Showing {shown} of {total} matches (--max-results {shown})."
+            ));
+        } else {
+            rec.message = Some(format!("Found {shown} matches."));
+        }
+        rec
+    }
+
+    /// find-refs location-only: dense list of reference locations.
+    pub fn references(
+        command: &str,
+        target: &str,
+        locations: Vec<RefLocation>,
+        truncated: bool,
+    ) -> Self {
+        let mut rec = Record::new(command, target, Status::Resolved, "references");
+        rec.message = Some(format!("Found {} references.", locations.len()));
+        rec.locations = locations;
+        rec.truncated = truncated;
+        rec
+    }
+
+    /// find-refs --context: references with enclosing scope bodies.
+    pub fn references_with_context(
+        command: &str,
+        target: &str,
+        contexts: Vec<RefContext>,
+        truncated: bool,
+    ) -> Self {
+        let mut rec = Record::new(command, target, Status::Resolved, "references_with_context");
+        rec.message = Some(format!("Found {} references with context.", contexts.len()));
+        rec.contexts = contexts;
+        rec.truncated = truncated;
+        rec
     }
 }
 

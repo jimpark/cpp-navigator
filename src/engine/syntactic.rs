@@ -298,7 +298,7 @@ fn is_function_prototype(node: Node) -> bool {
         match cur.kind() {
             "function_declarator" => return true,
             "pointer_declarator" | "reference_declarator" | "parenthesized_declarator" => {
-                match cur.child_by_field_name("declarator") {
+                match inner_declarator(cur) {
                     Some(inner) => cur = inner,
                     None => return false,
                 }
@@ -338,11 +338,41 @@ fn innermost_name(node: Node) -> Option<Node> {
         | "destructor_name" | "operator_name" => Some(node),
         "pointer_declarator" | "reference_declarator" | "array_declarator"
         | "parenthesized_declarator" | "init_declarator" | "function_declarator" => {
-            let inner = node.child_by_field_name("declarator")?;
+            let inner = inner_declarator(node)?;
             innermost_name(inner)
         }
-        _ => node.child_by_field_name("declarator").and_then(innermost_name),
+        _ => inner_declarator(node).and_then(innermost_name),
     }
+}
+
+/// The inner declarator of a wrapper node.
+///
+/// tree-sitter-cpp labels the child with a `declarator` field for most wrappers
+/// (`pointer_declarator`, `function_declarator`, …) but **not** for
+/// `reference_declarator`, where it is an unnamed child after the `&`/`&&`
+/// token. This peels both uniformly so reference returns/variables resolve.
+fn inner_declarator(node: Node) -> Option<Node> {
+    if let Some(d) = node.child_by_field_name("declarator") {
+        return Some(d);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|c| {
+        matches!(
+            c.kind(),
+            "identifier"
+                | "field_identifier"
+                | "type_identifier"
+                | "qualified_identifier"
+                | "destructor_name"
+                | "operator_name"
+                | "function_declarator"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "array_declarator"
+                | "parenthesized_declarator"
+                | "init_declarator"
+        )
+    })
 }
 
 /// Build the fully-qualified name from a node's explicit qualifier (e.g. an
@@ -367,10 +397,9 @@ fn enclosing_qualifier(node: Node, src: &[u8]) -> Option<String> {
         if matches!(
             n.kind(),
             "namespace_definition" | "class_specifier" | "struct_specifier"
-        ) {
-            if let Some(name) = n.child_by_field_name("name") {
-                parts.push(text(name, src));
-            }
+        ) && let Some(name) = n.child_by_field_name("name")
+        {
+            parts.push(text(name, src));
         }
         cur = n.parent();
     }
@@ -488,7 +517,7 @@ fn pointer_markers(node: Node, src: &[u8]) -> String {
             }
             _ => break,
         }
-        match cur.child_by_field_name("declarator") {
+        match inner_declarator(cur) {
             Some(inner) => cur = inner,
             None => break,
         }
@@ -515,7 +544,7 @@ fn find_function_declarator(node: Node) -> Option<Node> {
             "function_declarator" => return Some(cur),
             "pointer_declarator" | "reference_declarator" | "parenthesized_declarator"
             | "init_declarator" => {
-                cur = cur.child_by_field_name("declarator")?;
+                cur = inner_declarator(cur)?;
             }
             _ => return None,
         }
@@ -789,14 +818,16 @@ mod tests {
     #[test]
     fn declaration_return_type_includes_const_ref() {
         let dir = TempDir::new().unwrap();
-        let body = "const Widget &GetWidget(int id);\n";
+        // Primitive base type so tree-sitter parses the reference return
+        // unambiguously (an undeclared user type + `&` is a Stage-1 limit).
+        let body = "const int &Clamp(int x);\n";
         let p = write(&dir, "a.hpp", body);
         let eng = SyntacticEngine::new();
-        let res = eng.declarations("GetWidget", &candidates_for(&p));
+        let res = eng.declarations("Clamp", &candidates_for(&p));
         assert_eq!(res.len(), 1);
         assert_eq!(
             res[0].symbol.type_spelling.as_deref(),
-            Some("const Widget &(int)")
+            Some("const int &(int)")
         );
     }
 

@@ -54,6 +54,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 200)]
     pub max_candidates: usize,
 
+    /// When multiple definitions/declarations match (overloads), show full
+    /// content for up to this many results instead of just ambiguous locations.
+    #[arg(long, global = true, value_name = "N", default_value_t = 3)]
+    pub max_results: usize,
+
     /// Fallback context window in lines.
     #[arg(long, global = true, value_name = "N", default_value_t = 10)]
     pub window: usize,

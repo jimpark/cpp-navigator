@@ -48,6 +48,9 @@ pub struct FinderConfig {
     pub max_candidates: usize,
     /// Walker/searcher threads. `None` lets `ignore` pick (≈ #cores).
     pub threads: Option<usize>,
+    /// find-decl: run a header-only pass first, falling back to all files when
+    /// no header declares the symbol (design-specs §7.2 step 1).
+    pub prefer_headers: bool,
 }
 
 impl Default for FinderConfig {
@@ -133,10 +136,46 @@ struct Shared {
 
 /// Find candidate files+lines mentioning `target` under the configured roots.
 ///
+/// When `cfg.prefer_headers` is set (find-decl, design-specs §7.2 step 1), a
+/// header-only pass runs first; only an empty header result falls back to a
+/// full search over every configured extension.
+pub fn find_candidates(target: &str, cfg: &FinderConfig) -> Result<FinderResult> {
+    if cfg.prefer_headers {
+        let header_exts: Vec<String> = cfg
+            .extensions
+            .iter()
+            .filter(|e| is_header_ext(e))
+            .cloned()
+            .collect();
+        if !header_exts.is_empty() {
+            let header_cfg = FinderConfig {
+                extensions: header_exts,
+                prefer_headers: false,
+                ..cfg.clone()
+            };
+            let res = run_search(target, &header_cfg)?;
+            if !res.candidates.is_empty() {
+                return Ok(res);
+            }
+        }
+    }
+    run_search(target, cfg)
+}
+
+/// Header extensions preferred by find-decl's first pass (design-specs §7.2).
+const HEADER_EXTENSIONS: &[&str] = &["h", "hpp", "hh", "hxx"];
+
+/// Whether `ext` (no leading dot) is a C/C++ header extension.
+fn is_header_ext(ext: &str) -> bool {
+    HEADER_EXTENSIONS.contains(&ext)
+}
+
+/// Core single-pass candidate search over `cfg.extensions`.
+///
 /// Uses a parallel, ignore-aware walk; each file is line-searched with grep.
 /// Stops early once `max_candidates` distinct files have matched, setting
 /// `truncated`. Results are sorted deterministically (file, then byte offset).
-pub fn find_candidates(target: &str, cfg: &FinderConfig) -> Result<FinderResult> {
+fn run_search(target: &str, cfg: &FinderConfig) -> Result<FinderResult> {
     let needle = bare_component(target);
     let matcher = build_matcher(needle)?;
 
@@ -250,6 +289,29 @@ mod tests {
             roots: vec![root.to_path_buf()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn prefers_headers_when_available() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "a.cpp", "int needle;\n");
+        write(dir.path(), "a.hpp", "int needle;\n");
+        let mut c = cfg(dir.path());
+        c.prefer_headers = true;
+        let res = find_candidates("needle", &c).unwrap();
+        assert_eq!(res.candidates.len(), 1);
+        assert!(res.candidates[0].file_path.ends_with("a.hpp"));
+    }
+
+    #[test]
+    fn falls_back_to_sources_when_no_header() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "a.cpp", "int needle;\n");
+        let mut c = cfg(dir.path());
+        c.prefer_headers = true;
+        let res = find_candidates("needle", &c).unwrap();
+        assert_eq!(res.candidates.len(), 1);
+        assert!(res.candidates[0].file_path.ends_with("a.cpp"));
     }
 
     #[test]
