@@ -20,7 +20,7 @@ use grep::searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, WalkState};
 
 /// Default C/C++ source and header extensions (design-specs §12).
-pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "cc", "cpp", "cxx", "h", "hpp", "hh", "hxx"];
+pub const DEFAULT_EXTENSIONS: &[&str] = &["c", "cc", "cpp", "cxx", "h", "hpp", "hh", "hxx", "inl"];
 
 /// A textual hit produced by the candidate finder, before any parsing.
 #[derive(Clone, Debug, PartialEq, Eq)]

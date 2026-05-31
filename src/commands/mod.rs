@@ -148,6 +148,15 @@ fn resolve_one(
         resolutions
     };
 
+    // find-decl: if no forward declarations exist (inline definitions, local
+    // functions without prototypes), surface definitions so all overloads appear.
+    let decl_used_defs = resolutions.is_empty() && query == Query::Declaration;
+    let resolutions = if decl_used_defs {
+        SyntacticEngine::new().definitions(target, &result.candidates)
+    } else {
+        resolutions
+    };
+
     match resolutions.len() {
         0 => text_fallback(command, target, result, cli),
         1 => {
@@ -165,7 +174,15 @@ fn resolve_one(
                         Some("Expanded to the enclosing class/struct scope (--scope).".to_string());
                     rec
                 }
-                None => Record::resolved(command, target, &rtype, base),
+                None => {
+                    let mut rec = Record::resolved(command, target, &rtype, base);
+                    if decl_used_defs {
+                        rec.message = Some(
+                            "No forward declaration found; showing definition instead.".to_string(),
+                        );
+                    }
+                    rec
+                }
             };
             rec.truncated = result.truncated;
             rec
@@ -174,6 +191,11 @@ fn resolve_one(
             // Show all matches with full content (user-preferred behavior for overloads).
             let rtype = resolution_type(query, resolutions[0].symbol.kind);
             let mut rec = Record::multi_resolved(command, target, &rtype, &resolutions, n);
+            if decl_used_defs {
+                rec.message = Some(format!(
+                    "Found {n} overload(s); no forward declarations, showing definitions."
+                ));
+            }
             rec.truncated = result.truncated;
             rec
         }
@@ -828,5 +850,186 @@ mod tests {
         // At least one record survives.
         assert!(!trimmed.is_empty());
         assert!(trimmed.last().unwrap().budget_trimmed);
+    }
+
+    // --- find-decl fallback to definitions when no prototype exists ---
+
+    #[test]
+    fn find_decl_falls_back_to_single_definition_when_no_prototype() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        // Only a definition — no separate forward declaration.
+        fs::write(&p, "static void helper(int x) { x++; }\n").unwrap();
+
+        let eng = SyntacticEngine::new();
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("helper", &finder_cfg).unwrap();
+        assert!(!result.candidates.is_empty());
+
+        let cli = Cli {
+            command: Command::FindDecl { name: vec!["helper".into()] },
+            root: vec![dir.path().to_path_buf()],
+            semantic: false,
+            compile_db: None,
+            lang: vec![],
+            max_candidates: 200,
+            max_results: 3,
+            window: 10,
+            jobs: None,
+            no_ignore: false,
+            format: crate::cli::Format::Jsonl,
+            legend: false,
+            manifest: None,
+            budget: None,
+            quiet: false,
+        };
+        let record = resolve_one("find-decl", "helper", Query::Declaration, false, false, &result, &eng, &cli);
+        assert_eq!(record.status, output::Status::Resolved);
+        assert!(record.content.as_deref().unwrap_or("").contains("helper"));
+        assert!(record.message.as_deref().unwrap_or("").contains("No forward declaration"));
+    }
+
+    #[test]
+    fn find_decl_shows_all_definition_overloads_when_no_prototypes() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        // Two overloads with only definitions — no separate prototypes.
+        fs::write(
+            &p,
+            "void process(int x) { x++; }\nvoid process(double y) { y *= 2; }\n",
+        )
+        .unwrap();
+
+        let eng = SyntacticEngine::new();
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("process", &finder_cfg).unwrap();
+
+        let cli = Cli {
+            command: Command::FindDecl { name: vec!["process".into()] },
+            root: vec![dir.path().to_path_buf()],
+            semantic: false,
+            compile_db: None,
+            lang: vec![],
+            max_candidates: 200,
+            max_results: 5,
+            window: 10,
+            jobs: None,
+            no_ignore: false,
+            format: crate::cli::Format::Jsonl,
+            legend: false,
+            manifest: None,
+            budget: None,
+            quiet: false,
+        };
+        let record = resolve_one("find-decl", "process", Query::Declaration, false, false, &result, &eng, &cli);
+        assert_eq!(record.status, output::Status::Resolved);
+        // Both overloads should be in `results`.
+        assert_eq!(record.results.len(), 2);
+        assert!(record.message.as_deref().unwrap_or("").contains("overload"));
+    }
+
+    #[test]
+    fn find_decl_prefers_declaration_over_definition_when_both_exist() {
+        let dir = TempDir::new().unwrap();
+        let h = dir.path().join("a.hpp");
+        let cpp = dir.path().join("a.cpp");
+        fs::write(&h, "void compute(int x);\n").unwrap();
+        fs::write(&cpp, "void compute(int x) { x++; }\n").unwrap();
+
+        let eng = SyntacticEngine::new();
+        // Header-biased search returns only the header candidate.
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            prefer_headers: true,
+            ..Default::default()
+        };
+        let result = search::find_candidates("compute", &finder_cfg).unwrap();
+        // Candidates should come from the header only.
+        assert!(result.candidates.iter().all(|c| c.file_path.ends_with("a.hpp")));
+
+        let cli = Cli {
+            command: Command::FindDecl { name: vec!["compute".into()] },
+            root: vec![dir.path().to_path_buf()],
+            semantic: false,
+            compile_db: None,
+            lang: vec![],
+            max_candidates: 200,
+            max_results: 3,
+            window: 10,
+            jobs: None,
+            no_ignore: false,
+            format: crate::cli::Format::Jsonl,
+            legend: false,
+            manifest: None,
+            budget: None,
+            quiet: false,
+        };
+        let record = resolve_one("find-decl", "compute", Query::Declaration, false, false, &result, &eng, &cli);
+        assert_eq!(record.status, output::Status::Resolved);
+        // Should show the prototype, not the definition body.
+        let file = record.file_path.as_deref().unwrap_or("");
+        assert!(file.ends_with("a.hpp"), "expected header, got {file}");
+        // Message should NOT say "No forward declaration" since a prototype exists.
+        assert!(!record.message.as_deref().unwrap_or("").contains("No forward declaration"));
+    }
+
+    // --- .inl extension coverage ---
+
+    #[test]
+    fn find_candidates_searches_inl_files_by_default() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("impl.inl");
+        fs::write(&p, "inline void inl_func(int x) { x++; }\n").unwrap();
+
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("inl_func", &finder_cfg).unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert!(result.candidates[0].file_path.ends_with("impl.inl"));
+    }
+
+    #[test]
+    fn find_decl_finds_local_function_in_inl_file() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("helpers.inl");
+        fs::write(&p, "static int square(int x) { return x * x; }\n").unwrap();
+
+        let eng = SyntacticEngine::new();
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            prefer_headers: true,
+            ..Default::default()
+        };
+        let result = search::find_candidates("square", &finder_cfg).unwrap();
+        assert!(!result.candidates.is_empty());
+
+        let cli = Cli {
+            command: Command::FindDecl { name: vec!["square".into()] },
+            root: vec![dir.path().to_path_buf()],
+            semantic: false,
+            compile_db: None,
+            lang: vec![],
+            max_candidates: 200,
+            max_results: 3,
+            window: 10,
+            jobs: None,
+            no_ignore: false,
+            format: crate::cli::Format::Jsonl,
+            legend: false,
+            manifest: None,
+            budget: None,
+            quiet: false,
+        };
+        let record = resolve_one("find-decl", "square", Query::Declaration, false, false, &result, &eng, &cli);
+        assert_eq!(record.status, output::Status::Resolved);
+        assert!(record.content.as_deref().unwrap_or("").contains("square"));
     }
 }
