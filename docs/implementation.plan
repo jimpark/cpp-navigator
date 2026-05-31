@@ -1,0 +1,275 @@
+# Implementation Plan — `cpp-navigator`
+
+**Scope:** Rust implementation of the LLM-optimized C++ codebase navigator.
+**Derived from:** `docs/requirements.md` (PRD) and `docs/design-specs.md`.
+**Branch:** `rust-implementation`.
+
+This document is the phased build plan. Each phase is independently committable
+and leaves the tool in a working state. Section references (§) point at
+`design-specs.md` unless noted.
+
+---
+
+## Locked-in decisions
+
+These were confirmed during planning and govern every phase:
+
+| Topic | Decision | Rationale |
+|---|---|---|
+| Language | **Rust** (single lib + two bins) | One static binary, instant startup, first-class tree-sitter + ripgrep crates (§13). |
+| Architecture | **Hybrid:** tree-sitter default (Stage 1), libclang opt-in (Stage 2) | B for zero-config speed, A for true semantics; degradation ladder falls out naturally (§4). |
+| Text search | **Embed ripgrep's crates** (`ignore` + `grep-*`), no external `rg` | Self-contained, zero-egress, honors `.gitignore` (§13, open-decision §15.5). |
+| Stage 2 backend | Behind `--features semantic` + runtime `--semantic` | Keeps the default build free of any system library (libclang). |
+| Persistent index | **None in v1** — prefilter + in-process parse cache | Point queries don't need it; deferred to future work (§10, §16). |
+| Exit codes | `0` = well-formed answer incl. `not_found`; `2` = usage; `3` = internal | Simple agent control flow — always read stdout, branch on `status` (§9). |
+| Output | JSONL default; `bundle` profile; byte-faithful `content` | §8; fidelity contract §8.4 is absolute. |
+
+**Environment note:** the Rust toolchain (cargo/rustc 1.95, Homebrew) and
+libclang are already installed on the dev machine, but the sandbox's non-login
+shell needs `export PATH="/opt/homebrew/bin:$PATH"` prepended to build commands.
+
+---
+
+## Crate layout
+
+```
+src/
+  main.rs              cpp-navigator binary → cli::run()
+  bin/cppnav.rs        cppnav alias        → cli::run()
+  lib.rs               module wiring
+  cli.rs               clap parser, global flags, exit-code mapping (§12, §9)
+  commands/mod.rs      per-command pipelines + degradation ladder (§7, §9)
+  search/mod.rs        Stage 0 candidate finder on ignore + grep (§5, §10)
+  engine/
+    mod.rs             Engine trait (the extensibility seam, §5)
+    syntactic.rs       Stage 1 tree-sitter backend (§4, §11)
+    semantic.rs        Stage 2 libclang backend  [feature = "semantic"]
+  model.rs             internal types: Span, SourceRef, Symbol, Resolution (§6)
+  output/mod.rs        wire format: Record envelope + JSONL/bundle Writer (§8)
+```
+
+Key dependencies: `clap`, `serde`/`serde_json`, `anyhow`, `thiserror`,
+`ignore`, `grep`, `regex`, `rayon`, `tree-sitter`, `tree-sitter-cpp`; optional
+`clang`; dev `tempfile`.
+
+---
+
+## Phase status overview
+
+| Phase | Title | Status |
+|---|---|---|
+| 0 | Scaffold | ✅ done (`036596d`) |
+| 1 | Embedded ripgrep candidate finder | ✅ done (`4b42cb1`) |
+| 2 | tree-sitter syntactic engine (find-def / find-decl) | ✅ done (`6f65bf8`) |
+| 3 | `--scope` class/struct expansion for find-def | ✅ done |
+| 4 | find-decl polish (header bias, richer doc/type) | ⬜ |
+| 5 | find-refs (location-only + `--context`) | ⬜ |
+| 6 | Output ergonomics: bundle, manifest/batch, budget | ⬜ |
+| 7 | Stage 2 libclang `--semantic`; schema + CI guards | ⬜ |
+
+---
+
+## Phase 0 — Scaffold ✅
+
+**Done.** Two binaries sharing `cli::run()`; clap CLI for all three commands and
+every §12 global flag; internal data model (§6); wire format with JSONL/bundle
+writer (§8); the `Engine` trait seam (§5); pipeline stubbed to `not_found`.
+Exit codes verified (0 / 2 / 3).
+
+---
+
+## Phase 1 — Embedded ripgrep candidate finder ✅
+
+**Done.** Stage 0 on ripgrep's own crates — no external `rg`.
+- `ignore::WalkBuilder` parallel, gitignore-aware walk; `require_git(false)` so
+  `.gitignore` applies even outside a git work tree.
+- `grep` `RegexMatcher`/`Searcher` whole-word identifier line search.
+- `bare_component()` peels `A::B::f → f` to maximize prefilter recall.
+- `--max-candidates` distinct-file cap sets `truncated` and stops the walk.
+- Deterministic ordering (file path, then byte offset).
+- Wired into dispatch: text hits → fallback window, zero hits → `not_found`.
+
+Verified on duckdb (4,943 files): sub-second; `.gitignore` honored; `--no-ignore`
+reaches build artifacts; worst-case common identifier capped without hanging.
+
+---
+
+## Phase 2 — tree-sitter syntactic engine ✅
+
+**Done.** Stage 1 default backend (`engine/syntactic.rs`).
+- `SyntacticEngine` implements `Engine` (`definitions`/`declarations`/
+  `enclosing_scope`); candidates parsed in parallel via rayon.
+- Declarator-name matching peels pointer/reference/array wrappers, handles
+  qualified `A::B::f`, operators, destructors (§11).
+- Definition vs declaration by body/initializer presence.
+- `template_declaration` span captured whole (prefix through body).
+- find-decl extracts `signature`, `type` (`ret(params)`), adjacent Doxygen/comment.
+- Resolver ladder in dispatch: 1 → `resolved`, >1 → `ambiguous`, 0-but-text →
+  `fallback`, 0 → `not_found`.
+
+Verified on duckdb: `NextPowerOfTwo`/`GetTypeIdSize` resolve with byte-fidelity
+PASS; ubiquitous names correctly `ambiguous`; `find-decl MetaTransaction` resolves
+with signature. 19 tests; clippy clean.
+
+---
+
+## Phase 3 — `--scope` class/struct expansion (find-def) ✅
+
+**Done.** `enclosing_class_scope` added to the `Engine` trait + `SyntacticEngine`
+(walks parents to the nearest `class_specifier`/`struct_specifier`, expands to a
+wrapping `template_declaration`). `--scope` is threaded from `Command::FindDef`
+into `resolve_one`; a resolved find-def member is widened via
+`expand_to_class_scope`, re-slicing `content` from disk so §8.4 holds for the
+wider span, and tagged with a scope message. Graceful no-op for free functions
+and out-of-line members. Verified on duckdb: `find-def TupleData --scope` expands
+the inline member to the whole `struct UpdateInfo` (byte-fidelity PASS);
+`NextPowerOfTwo --scope` is unchanged. 24 tests; clippy clean.
+
+**Goal:** implement PRD §2.3 / design §7.1 step 3 — when `--scope` is set and a
+resolved definition is a class/struct member (or out-of-line member function),
+expand the reported span to the **entire enclosing `class_specifier` /
+`struct_specifier` / template** that houses the member.
+
+**Work:**
+- Add `enclosing_class_scope(file, byte_offset) -> Option<Span>` to
+  `SyntacticEngine` (walk parents to nearest `class_specifier`/`struct_specifier`,
+  expanding to a wrapping `template_declaration` if present). Distinct from the
+  existing `enclosing_scope` (function/template) used by find-refs context.
+- In `commands::resolve_one`, when `cli` carries `--scope` for `find-def`:
+  after a `resolved` match, recompute the span via the class-scope lookup and
+  rebuild the `content` bytes from the wider span. If the match is not inside a
+  class/struct, return the member result unchanged (graceful no-op).
+- Thread the `scope` flag from `Command::FindDef { scope }` into `resolve_one`
+  (currently destructured away).
+- Decide ambiguity interaction: `--scope` applies per resolved match; in the
+  `ambiguous` case leave candidates as-is (member-level locations) for v1.
+
+**Tests (unit):**
+- Member function defined inline in a class → with `--scope`, span covers the
+  whole `class { ... }`; without `--scope`, just the method.
+- Out-of-line member (`void C::m() {}`) with `--scope` → still returns the method
+  (its lexical encloser is the TU, not the class) — documents the known limit;
+  semantic mode (Phase 7) is where cross-file class pull would live.
+- Templated class member → span includes the `template<...>` prefix.
+- Free function with `--scope` → unchanged (no enclosing class).
+- Byte-fidelity assertion on the expanded span.
+
+**Acceptance:**
+- `find-def <member> --scope` on duckdb returns a class/struct body span whose
+  `file[start_byte..end_byte]` round-trips byte-for-byte.
+- Full `cargo test` + `cargo clippy` clean.
+
+**Commit:** "Phase 3: --scope class/struct expansion for find-def".
+
+---
+
+## Phase 4 — find-decl polish
+
+**Goal:** sharpen design §7.2 / §11 header handling and declaration metadata.
+
+**Work:**
+- **Header bias:** candidate finder ranks/searches header extensions
+  (`.h/.hpp/.hh/.hxx`) first; fall back to all files if no header hit (§7.2 step 1).
+  Implement as a two-pass finder or a post-sort preferring headers.
+- **Doc extraction:** broaden beyond the immediate run — handle both `///`/`//!`
+  line-doc runs and `/** ... */` block Doxygen; keep byte-faithful text.
+- **Type spelling:** improve `ret(params)` for ref/ptr returns, `const`,
+  trailing-return-type, and member-qualified signatures where syntactically clear.
+- **Method vs free declaration:** populate `Kind::Method` for `field_declaration`
+  prototypes; set `qualified_name` from enclosing namespace/class where available.
+
+**Tests:** header-preferred resolution; block-comment doc; const/ref signatures;
+member declaration kind + qualified name.
+
+**Acceptance:** `find-decl` on duckdb headers returns signature + doc + type with
+header paths preferred. Tests + clippy clean.
+
+**Commit:** "Phase 4: find-decl header bias and richer declaration metadata".
+
+---
+
+## Phase 5 — find-refs (location-only + `--context`)
+
+**Goal:** implement design §7.3 fully.
+
+**Work:**
+- **Location-only (default):** emit a dense per-hit record (or one record with a
+  `locations: [{file, line}]` array — choose the more token-efficient shape and
+  document it in the schema). No body parsing; this is the cheapest path (§7.3.2).
+- **`--context`:** for each hit, use `enclosing_scope` (function/template) to emit
+  the surrounding body span + byte-faithful `content` (§7.3.3).
+- De-duplicate hits; keep deterministic ordering; respect `--max-candidates`
+  with `truncated`.
+- Filter out the definition site vs uses? v1: include all textual references
+  (no semantic filtering); note the limitation.
+
+**Tests:** location-only density; `--context` returns enclosing function span;
+references across multiple files merged deterministically; fidelity on context.
+
+**Acceptance:** `find-refs size --root duckdb` returns compact locations fast;
+`--context` returns caller bodies. Tests + clippy clean.
+
+**Commit:** "Phase 5: find-refs location-only and --context modes".
+
+---
+
+## Phase 6 — Output ergonomics
+
+**Goal:** the human-in-the-loop transport features (design §3.2, §8.8–§8.10).
+
+**Work:**
+- **Bundle polish:** real token estimate footer (replace the `chars/4` heuristic
+  with a defensible estimator); `--legend` one-time field key (§8.8).
+- **Manifest / batch:** `--manifest <path>` (one query per line) and repeated
+  targets; concatenate + de-duplicate; per-query headers in bundle mode (§8.9).
+  One run → one paste.
+- **Budget:** `--budget <n>` selection-only trim — prefer location-only over
+  contextual, cap candidates, drop lowest-confidence; emit `budget_trimmed: true`
+  + message; **never** edit payload bytes (§8.10, §8.4).
+
+**Tests:** bundle round-trip; manifest parses + dedups; budget trims by selection
+and sets the marker without altering any retained `content`.
+
+**Acceptance:** a single `--manifest ... --format bundle --budget N` run produces
+one paste-able block under the token cap. Tests + clippy clean.
+
+**Commit:** "Phase 6: bundle/manifest/budget output ergonomics".
+
+---
+
+## Phase 7 — Stage 2 libclang + hardening
+
+**Goal:** the opt-in precision backend and the guarantees that survive review.
+
+**Work:**
+- **`engine/semantic.rs`** behind `#[cfg(feature = "semantic")]`: parse with
+  libclang using `compile_commands.json`; resolve overloads/templates/namespaces
+  to a single `resolved` where the build graph disambiguates (§4 Stage 2, §8.5
+  note). Falls back to Stage 1 when DB/flags absent.
+- Wire `--semantic` + `--compile-db`; select engine in dispatch; the default
+  build (no feature) ignores the flag with a clear stderr note.
+- **JSON Schema** for `schema_version` 1.0; validate emitted records in tests (§14).
+- **Golden + fidelity tests** over fixture repos (§14).
+- **Zero-egress CI guard:** run under a network-disabled sandbox / syscall
+  monitor; fail on any `socket`/`connect` to non-local (§3.1, §14).
+- **Perf benchmark** asserting sub-second point queries on a large synthetic tree.
+
+**Acceptance:** `--features semantic --semantic` collapses a known overload to one
+`resolved` on a fixture with a compile DB; schema validation + zero-egress test
+green in CI; default build unchanged and self-contained.
+
+**Commit(s):** "Phase 7: libclang semantic backend", "Phase 7: schema + zero-egress
+CI + benchmarks" (may split).
+
+---
+
+## Cross-cutting conventions
+
+- **Fidelity first:** any new `content`/`content_buffer` must satisfy
+  `file[start_byte..end_byte) == bytes` (§8.4); add a fidelity assertion with each
+  new span-producing path.
+- **Graceful degradation:** never hard-fail when a lower rung can answer (§9).
+- **Determinism:** sort merged results by `(file_path, start_byte)` for stable
+  output across threads.
+- **Per phase:** `cargo test` + `cargo clippy --all-targets` clean; a duckdb smoke
+  test for the touched command; one focused commit; no push unless asked.

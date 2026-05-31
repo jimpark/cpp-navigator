@@ -27,10 +27,10 @@ enum Query {
 
 /// Run the selected command, writing records to stdout.
 pub fn dispatch(cli: &Cli) -> Result<()> {
-    let (command_name, targets, query) = match &cli.command {
-        Command::FindDef { name, .. } => ("find-def", name, Query::Definition),
-        Command::FindDecl { name } => ("find-decl", name, Query::Declaration),
-        Command::FindRefs { name, .. } => ("find-refs", name, Query::References),
+    let (command_name, targets, query, scope) = match &cli.command {
+        Command::FindDef { name, scope } => ("find-def", name, Query::Definition, *scope),
+        Command::FindDecl { name } => ("find-decl", name, Query::Declaration, false),
+        Command::FindRefs { name, .. } => ("find-refs", name, Query::References, false),
     };
 
     let finder_cfg = build_finder_config(cli);
@@ -41,7 +41,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
 
     for target in targets {
         let result = search::find_candidates(target, &finder_cfg)?;
-        let record = resolve_one(command_name, target, query, &result, &engine, cli);
+        let record = resolve_one(command_name, target, query, scope, &result, &engine, cli);
         writer.write(&record)?;
     }
 
@@ -54,6 +54,7 @@ fn resolve_one(
     command: &str,
     target: &str,
     query: Query,
+    scope: bool,
     result: &FinderResult,
     engine: &SyntacticEngine,
     cli: &Cli,
@@ -76,9 +77,25 @@ fn resolve_one(
     match resolutions.len() {
         0 => text_fallback(command, target, result, cli),
         1 => {
-            let r = &resolutions[0];
-            let rtype = resolution_type(query, r.symbol.kind);
-            let mut rec = Record::resolved(command, target, &rtype, r);
+            let base = &resolutions[0];
+            let rtype = resolution_type(query, base.symbol.kind);
+            // `--scope` (find-def): widen a resolved member to its enclosing
+            // class/struct. Graceful no-op when the match is not inside one
+            // (free function, out-of-line member) — design §7.1 step 3.
+            let expanded = if scope && query == Query::Definition {
+                expand_to_class_scope(engine, base)
+            } else {
+                None
+            };
+            let mut rec = match &expanded {
+                Some(e) => {
+                    let mut rec = Record::resolved(command, target, &rtype, e);
+                    rec.message =
+                        Some("Expanded to the enclosing class/struct scope (--scope).".to_string());
+                    rec
+                }
+                None => Record::resolved(command, target, &rtype, base),
+            };
             rec.truncated = result.truncated;
             rec
         }
@@ -105,6 +122,22 @@ fn resolution_type(query: Query, kind: Kind) -> String {
         },
         Query::References => "reference".to_string(),
     }
+}
+
+/// Widen a resolved member to its enclosing `class`/`struct` (or wrapping
+/// `template`) span, re-slicing `content` from disk so the byte-fidelity
+/// contract (§8.4) holds for the wider span. Returns `None` when the match is
+/// not lexically inside a class/struct, leaving the member result unchanged.
+fn expand_to_class_scope(engine: &SyntacticEngine, r: &Resolution) -> Option<Resolution> {
+    let span = engine.enclosing_class_scope(&r.source_ref.file_path, r.source_ref.span.start_byte)?;
+    let src = std::fs::read(&r.source_ref.file_path).ok()?;
+    if span.end_byte > src.len() || span.start_byte > span.end_byte {
+        return None;
+    }
+    let mut out = r.clone();
+    out.content_bytes = src[span.start_byte..span.end_byte].to_vec();
+    out.source_ref.span = span;
+    Some(out)
 }
 
 /// Map a resolution to an ambiguous-candidate location (design-specs §8.5).
@@ -218,5 +251,54 @@ mod tests {
         assert_eq!(resolution_type(Query::Definition, Kind::Function), "function_definition");
         assert_eq!(resolution_type(Query::Definition, Kind::Template), "template_definition");
         assert_eq!(resolution_type(Query::Declaration, Kind::Function), "declaration");
+    }
+
+    use crate::engine::Engine;
+    use crate::search::Candidate;
+
+    fn one_candidate(p: &std::path::Path) -> Vec<Candidate> {
+        vec![Candidate {
+            file_path: p.to_path_buf(),
+            line: 1,
+            byte_offset: 0,
+            snippet: String::new(),
+        }]
+    }
+
+    #[test]
+    fn scope_expands_inline_member_with_byte_fidelity() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("w.hpp");
+        let body = "class Widget {\npublic:\n    int area() { return w * h; }\n    int w, h;\n};\n";
+        fs::write(&p, body).unwrap();
+        let eng = SyntacticEngine::new();
+
+        let defs = eng.definitions("area", &one_candidate(&p));
+        assert_eq!(defs.len(), 1);
+        // Without scope, the member span is just the method.
+        let member = &defs[0];
+        assert!(String::from_utf8_lossy(&member.content_bytes).starts_with("int area()"));
+
+        // With scope, expand to the whole class.
+        let expanded = expand_to_class_scope(&eng, member).unwrap();
+        let s = String::from_utf8_lossy(&expanded.content_bytes);
+        assert!(s.starts_with("class Widget {"));
+        assert!(s.trim_end().ends_with('}'));
+        // Byte-fidelity: re-slice from disk equals reported content (§8.4).
+        let disk = fs::read(&p).unwrap();
+        let span = &expanded.source_ref.span;
+        assert_eq!(&disk[span.start_byte..span.end_byte], expanded.content_bytes.as_slice());
+    }
+
+    #[test]
+    fn scope_is_noop_for_free_function() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        fs::write(&p, "int add(int a, int b) {\n    return a + b;\n}\n").unwrap();
+        let eng = SyntacticEngine::new();
+        let defs = eng.definitions("add", &one_candidate(&p));
+        assert_eq!(defs.len(), 1);
+        // No enclosing class → no expansion.
+        assert!(expand_to_class_scope(&eng, &defs[0]).is_none());
     }
 }

@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use serde::Serialize;
 
 use crate::cli::Format;
-use crate::model::{Kind, Resolution};
+use crate::model::Resolution;
 
 pub const SCHEMA_VERSION: &str = "1.0";
 pub const TOOL: &str = "cpp-navigator";

@@ -71,6 +71,24 @@ impl Engine for SyntacticEngine {
         }
         None
     }
+
+    fn enclosing_class_scope(&self, file: &Path, byte_offset: usize) -> Option<Span> {
+        let src = std::fs::read(file).ok()?;
+        let tree = parse(&src)?;
+        let root = tree.root_node();
+        let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
+        // Walk up to the nearest class/struct definition. Expand to a wrapping
+        // `template_declaration` so a templated class includes its `template<...>`
+        // prefix (see `report_node`).
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if matches!(n.kind(), "class_specifier" | "struct_specifier") {
+                return Some(span_of(report_node(n)));
+            }
+            cur = n.parent();
+        }
+        None
+    }
 }
 
 /// Whether we are collecting definitions (with a body/initializer) or
@@ -282,10 +300,10 @@ fn is_function_prototype(node: Node) -> bool {
 /// enclosing `template_declaration` so the full `template<...>` prefix is
 /// included (design-specs §11).
 fn report_node(node: Node) -> Node {
-    if let Some(parent) = node.parent() {
-        if parent.kind() == "template_declaration" {
-            return parent;
-        }
+    if let Some(parent) = node.parent()
+        && parent.kind() == "template_declaration"
+    {
+        return parent;
     }
     node
 }
@@ -553,5 +571,60 @@ mod tests {
         let span = eng.enclosing_scope(&p, off).unwrap();
         assert_eq!(span.start_line, 1);
         assert_eq!(span.end_line, 3);
+    }
+
+    #[test]
+    fn enclosing_class_scope_covers_inline_member() {
+        let dir = TempDir::new().unwrap();
+        let body = "class Widget {\npublic:\n    int area() { return w * h; }\n    int w, h;\n};\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        // Offset inside the inline method body.
+        let off = body.find("return w * h").unwrap();
+        let span = eng.enclosing_class_scope(&p, off).unwrap();
+        // Spans the whole `class Widget { ... }` (excluding the trailing `;`).
+        let disk = fs::read(&p).unwrap();
+        let slice = &disk[span.start_byte..span.end_byte];
+        assert!(slice.starts_with(b"class Widget {"));
+        assert!(slice.ends_with(b"}"));
+        assert_eq!(span.start_line, 1);
+        assert_eq!(span.end_line, 5);
+    }
+
+    #[test]
+    fn enclosing_class_scope_includes_template_prefix() {
+        let dir = TempDir::new().unwrap();
+        let body =
+            "template <typename T>\nclass Box {\npublic:\n    T get() { return v; }\n    T v;\n};\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        let off = body.find("return v").unwrap();
+        let span = eng.enclosing_class_scope(&p, off).unwrap();
+        let disk = fs::read(&p).unwrap();
+        let slice = &disk[span.start_byte..span.end_byte];
+        // The reported span starts at the `template` keyword.
+        assert!(slice.starts_with(b"template <typename T>"));
+        assert_eq!(span.start_line, 1);
+    }
+
+    #[test]
+    fn enclosing_class_scope_none_for_out_of_line_member() {
+        let dir = TempDir::new().unwrap();
+        // Out-of-line member: lexical encloser is the TU, not the class.
+        let body = "void Foo::bar() {\n    return;\n}\n";
+        let p = write(&dir, "a.cpp", body);
+        let eng = SyntacticEngine::new();
+        let off = body.find("return").unwrap();
+        assert!(eng.enclosing_class_scope(&p, off).is_none());
+    }
+
+    #[test]
+    fn enclosing_class_scope_none_for_free_function() {
+        let dir = TempDir::new().unwrap();
+        let body = "int add(int a, int b) {\n    return a + b;\n}\n";
+        let p = write(&dir, "a.cpp", body);
+        let eng = SyntacticEngine::new();
+        let off = body.find("return").unwrap();
+        assert!(eng.enclosing_class_scope(&p, off).is_none());
     }
 }

@@ -26,6 +26,12 @@ pub trait Engine {
     fn declarations(&self, target: &str, candidates: &[Candidate]) -> Vec<Resolution>;
 
     /// Find the enclosing function/template span around a byte offset, for
-    /// `--scope` (find-def) and `--context` (find-refs).
+    /// `--context` (find-refs).
     fn enclosing_scope(&self, file: &Path, byte_offset: usize) -> Option<Span>;
+
+    /// Find the enclosing `class`/`struct` (or wrapping `template`) span around a
+    /// byte offset, for `--scope` (find-def). Returns `None` when the offset is
+    /// not lexically inside a class/struct body (e.g. a free function or an
+    /// out-of-line member definition `void C::m() {}`).
+    fn enclosing_class_scope(&self, file: &Path, byte_offset: usize) -> Option<Span>;
 }
