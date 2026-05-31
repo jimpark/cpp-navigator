@@ -187,7 +187,11 @@ fn try_match(
 ) -> Option<Resolution> {
     let kind = classify(node, mode)?;
     let decl = name_node(node)?;
-    let (bare, qualified) = name_text(decl, src)?;
+    let (bare, explicit_qualified) = name_text(decl, src)?;
+    // Fold in enclosing namespace/class scopes so a namespace-qualified target
+    // (`duckdb::UpdateInfo`) matches a bare declaration nested in that scope
+    // (design-specs §7.2).
+    let qualified = qualify(node, &bare, explicit_qualified, src);
 
     if !name_matches(target, &bare, qualified.as_deref()) {
         return None;
@@ -262,7 +266,15 @@ fn classify(node: Node, mode: Mode) -> Option<Kind> {
             }
         }
         // Class members (method prototypes, member variables).
-        "field_declaration" => (mode == Mode::Declaration).then_some(Kind::Member),
+        // Class members: a function prototype is a method, otherwise a data
+        // member (design-specs §7.2, §11).
+        "field_declaration" if mode == Mode::Declaration => {
+            Some(if is_function_prototype(node) {
+                Kind::Method
+            } else {
+                Kind::Member
+            })
+        }
         _ => None,
     }
 }
@@ -333,6 +345,43 @@ fn innermost_name(node: Node) -> Option<Node> {
     }
 }
 
+/// Build the fully-qualified name from a node's explicit qualifier (e.g. an
+/// out-of-line `Foo::bar`) and any enclosing namespace/class scopes. Returns
+/// `None` only for a bare name at translation-unit scope.
+fn qualify(node: Node, bare: &str, explicit: Option<String>, src: &[u8]) -> Option<String> {
+    match (explicit, enclosing_qualifier(node, src)) {
+        (Some(e), Some(ns)) => Some(format!("{ns}::{e}")),
+        (Some(e), None) => Some(e),
+        (None, Some(ns)) => Some(format!("{ns}::{bare}")),
+        (None, None) => None,
+    }
+}
+
+/// Concatenate the names of `namespace`/`class`/`struct` ancestors of `node`,
+/// outermost first (e.g. `duckdb::Catalog`). `None` at translation-unit scope.
+/// Anonymous namespaces (no `name` field) contribute nothing.
+fn enclosing_qualifier(node: Node, src: &[u8]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if matches!(
+            n.kind(),
+            "namespace_definition" | "class_specifier" | "struct_specifier"
+        ) {
+            if let Some(name) = n.child_by_field_name("name") {
+                parts.push(text(name, src));
+            }
+        }
+        cur = n.parent();
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        parts.reverse();
+        Some(parts.join("::"))
+    }
+}
+
 /// Extract `(bare, qualified)` names from a name node.
 /// `A::B::f` → ("f", Some("A::B::f")); `f` → ("f", None).
 fn name_text(node: Node, src: &[u8]) -> Option<(String, Option<String>)> {
@@ -370,20 +419,92 @@ fn name_matches(target: &str, bare: &str, qualified: Option<&str>) -> bool {
 /// `ret(param_types...)`; for variables: the declared type text. Omitted when it
 /// cannot be derived confidently.
 fn type_spelling(node: Node, src: &[u8]) -> Option<String> {
-    let ret = node.child_by_field_name("type").map(|t| text(t, src))?;
     let decl = node.child_by_field_name("declarator")?;
     if let Some(func) = find_function_declarator(decl) {
+        // Prefer a trailing return type (`auto f() -> T`); otherwise the base
+        // type with leading qualifiers and any pointer/reference markers.
+        let ret = trailing_return(func, src)
+            .or_else(|| rendered_type(node, src))
+            .unwrap_or_default();
         let params = func.child_by_field_name("parameters")?;
         let mut cursor = params.walk();
         let types: Vec<String> = params
             .children(&mut cursor)
             .filter(|c| c.kind() == "parameter_declaration")
-            .filter_map(|p| p.child_by_field_name("type").map(|t| text(t, src)))
+            .filter_map(|p| rendered_type(p, src))
             .collect();
         Some(format!("{}({})", ret.trim(), types.join(", ")))
     } else {
-        Some(ret.trim().to_string())
+        rendered_type(node, src)
     }
+}
+
+/// Render the type of a `declaration`/`parameter_declaration`/`field_declaration`
+/// as `[qualifiers] base [*&]`, e.g. `const Widget &`. Best-effort: captures
+/// leading `const`/`volatile` and pointer/reference markers from the declarator.
+fn rendered_type(node: Node, src: &[u8]) -> Option<String> {
+    let base = node.child_by_field_name("type").map(|t| text(t, src))?;
+    let mut prefix = String::new();
+    let mut cursor = node.walk();
+    for ch in node.children(&mut cursor) {
+        if ch.kind() == "type_qualifier" {
+            if !prefix.is_empty() {
+                prefix.push(' ');
+            }
+            prefix.push_str(text(ch, src).trim());
+        }
+    }
+    let suffix = node
+        .child_by_field_name("declarator")
+        .map(|d| pointer_markers(d, src))
+        .unwrap_or_default();
+    let mut out = String::new();
+    if !prefix.is_empty() {
+        out.push_str(&prefix);
+        out.push(' ');
+    }
+    out.push_str(base.trim());
+    if !suffix.is_empty() {
+        out.push(' ');
+        out.push_str(&suffix);
+    }
+    Some(out)
+}
+
+/// Collect pointer/reference markers (`*`, `&`, `&&`) wrapping a declarator,
+/// stopping at the function declarator or terminal name.
+fn pointer_markers(node: Node, src: &[u8]) -> String {
+    let mut markers = String::new();
+    let mut cur = node;
+    loop {
+        match cur.kind() {
+            "pointer_declarator" => markers.push('*'),
+            "reference_declarator" => {
+                // The leading token is `&` or `&&`.
+                match cur.child(0) {
+                    Some(tok) => markers.push_str(&text(tok, src)),
+                    None => markers.push('&'),
+                }
+            }
+            _ => break,
+        }
+        match cur.child_by_field_name("declarator") {
+            Some(inner) => cur = inner,
+            None => break,
+        }
+    }
+    markers
+}
+
+/// A function declarator's trailing return type (`-> T`), if present.
+fn trailing_return(func: Node, src: &[u8]) -> Option<String> {
+    let mut cursor = func.walk();
+    for ch in func.children(&mut cursor) {
+        if ch.kind() == "trailing_return_type" {
+            return Some(text(ch, src).trim_start_matches("->").trim().to_string());
+        }
+    }
+    None
 }
 
 /// Find a `function_declarator` by peeling pointer/reference wrappers.
@@ -626,5 +747,78 @@ mod tests {
         let eng = SyntacticEngine::new();
         let off = body.find("return").unwrap();
         assert!(eng.enclosing_class_scope(&p, off).is_none());
+    }
+
+    #[test]
+    fn method_prototype_kind_and_qualified_name() {
+        let dir = TempDir::new().unwrap();
+        let body = "namespace ns {\nclass C {\n    int compute(double x);\n};\n}\n";
+        let p = write(&dir, "c.hpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("compute", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].symbol.kind, Kind::Method);
+        assert_eq!(res[0].symbol.qualified_name.as_deref(), Some("ns::C::compute"));
+        assert_eq!(res[0].symbol.type_spelling.as_deref(), Some("int(double)"));
+    }
+
+    #[test]
+    fn namespaced_type_matches_qualified_target() {
+        let dir = TempDir::new().unwrap();
+        let body = "namespace duckdb {\nstruct UpdateInfo { int x; };\n}\n";
+        let p = write(&dir, "u.hpp", body);
+        let eng = SyntacticEngine::new();
+        assert_eq!(eng.definitions("duckdb::UpdateInfo", &candidates_for(&p)).len(), 1);
+        assert_eq!(eng.definitions("UpdateInfo", &candidates_for(&p)).len(), 1);
+        assert_eq!(eng.definitions("wrong::UpdateInfo", &candidates_for(&p)).len(), 0);
+    }
+
+    #[test]
+    fn block_comment_doc_is_captured() {
+        let dir = TempDir::new().unwrap();
+        let body = "/** Frobnicate the widget.\n *  @param n count\n */\nvoid Frob(int n);\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("Frob", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        let doc = res[0].symbol.doc.as_deref().unwrap();
+        assert!(doc.starts_with("/**"));
+        assert!(doc.contains("@param n count"));
+    }
+
+    #[test]
+    fn declaration_return_type_includes_const_ref() {
+        let dir = TempDir::new().unwrap();
+        let body = "const Widget &GetWidget(int id);\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("GetWidget", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        assert_eq!(
+            res[0].symbol.type_spelling.as_deref(),
+            Some("const Widget &(int)")
+        );
+    }
+
+    #[test]
+    fn declaration_pointer_return_type() {
+        let dir = TempDir::new().unwrap();
+        let body = "int *Allocate(size_t n);\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("Allocate", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].symbol.type_spelling.as_deref(), Some("int *(size_t)"));
+    }
+
+    #[test]
+    fn declaration_trailing_return_type() {
+        let dir = TempDir::new().unwrap();
+        let body = "auto Compute(int x) -> double;\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("Compute", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].symbol.type_spelling.as_deref(), Some("double(int)"));
     }
 }

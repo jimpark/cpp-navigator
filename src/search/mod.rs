@@ -58,6 +58,7 @@ impl Default for FinderConfig {
             respect_ignore: true,
             max_candidates: 200,
             threads: None,
+            prefer_headers: false,
         }
     }
 }

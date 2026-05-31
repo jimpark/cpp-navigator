@@ -62,7 +62,7 @@ Key dependencies: `clap`, `serde`/`serde_json`, `anyhow`, `thiserror`,
 | 1 | Embedded ripgrep candidate finder | ✅ done (`4b42cb1`) |
 | 2 | tree-sitter syntactic engine (find-def / find-decl) | ✅ done (`6f65bf8`) |
 | 3 | `--scope` class/struct expansion for find-def | ✅ done |
-| 4 | find-decl polish (header bias, richer doc/type) | ⬜ |
+| 4 | find-decl polish (header bias, richer doc/type) | ✅ done |
 | 5 | find-refs (location-only + `--context`) | ⬜ |
 | 6 | Output ergonomics: bundle, manifest/batch, budget | ⬜ |
 | 7 | Stage 2 libclang `--semantic`; schema + CI guards | ⬜ |
@@ -163,7 +163,25 @@ expand the reported span to the **entire enclosing `class_specifier` /
 
 ---
 
-## Phase 4 — find-decl polish
+## Phase 4 — find-decl polish ✅
+
+**Done.** find-decl is now header-biased and emits richer declaration metadata.
+- **Header bias:** `FinderConfig.prefer_headers` drives a header-only first pass
+  (`.h/.hpp/.hh/.hxx`); only an empty header result falls back to a full search.
+  Set for `Query::Declaration` in dispatch.
+- **Qualified names from scope:** `enclosing_qualifier` walks `namespace`/`class`/
+  `struct` ancestors so a namespace-qualified target (`duckdb::UpdateInfo`,
+  `UpdateInfo::GetCompactCapacity`) matches a bare nested declaration; the result's
+  `qualified_name` is populated.
+- **Method vs member:** `field_declaration` prototypes classify as `Kind::Method`,
+  data members as `Kind::Member`.
+- **Type spelling:** `rendered_type` adds leading `const`/qualifiers and `*`/`&`/`&&`
+  markers; trailing return types (`auto f() -> T`) are honored. Doc extraction
+  already captured `///`/`//!` runs and `/** … */` blocks (now covered by tests).
+
+Verified on duckdb: `find-decl UpdateInfo::GetCompactCapacity` resolves to the
+header prototype (`update_info.hpp:101`, `type idx_t(idx_t)`); the bare name is
+correctly `ambiguous` across two classes. 36 tests; clippy clean.
 
 **Goal:** sharpen design §7.2 / §11 header handling and declaration metadata.
 

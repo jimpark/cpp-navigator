@@ -33,7 +33,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
         Command::FindRefs { name, .. } => ("find-refs", name, Query::References, false),
     };
 
-    let finder_cfg = build_finder_config(cli);
+    let mut finder_cfg = build_finder_config(cli);
+    // find-decl is header-biased (design-specs §7.2 step 1).
+    finder_cfg.prefer_headers = query == Query::Declaration;
     let engine = SyntacticEngine::new();
 
     let stdout = std::io::stdout();
@@ -194,6 +196,7 @@ fn build_finder_config(cli: &Cli) -> FinderConfig {
         respect_ignore: !cli.no_ignore,
         max_candidates: cli.max_candidates,
         threads: cli.jobs,
+        prefer_headers: false,
     }
 }
 
