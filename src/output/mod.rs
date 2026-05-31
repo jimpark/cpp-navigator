@@ -354,15 +354,188 @@ impl<W: Write> Writer<W> {
                 )?;
             }
             writeln!(self.out, "```json")?;
-            let mut chars = 0usize;
+            let mut total_bytes = 0usize;
             for line in &self.buffered {
-                chars += line.len();
+                total_bytes += line.len();
                 writeln!(self.out, "{line}")?;
             }
             writeln!(self.out, "```")?;
-            // Rough heuristic until the real estimator lands (Phase 6).
-            writeln!(self.out, "// ~{} tokens", chars / 4)?;
+            writeln!(self.out, "// ~{} tokens", estimate_tokens(total_bytes))?;
         }
         self.out.flush()
+    }
+}
+
+/// Estimate token count from byte length.
+///
+/// Uses a conservative heuristic: JSON + C++ source averages ~3.5 chars per
+/// token for typical LLM tokenizers (cl100k/GPT-4 family). We use 3.3 to err
+/// on the side of overestimating (safer for budget enforcement).
+pub fn estimate_tokens(bytes: usize) -> usize {
+    // Integer math: bytes * 10 / 33 ≈ bytes / 3.3
+    (bytes * 10).div_ceil(33)
+}
+
+/// Apply `--budget` selection-only trim to a set of records.
+///
+/// Trims by dropping records from the end until the estimated token count is
+/// within budget. For records with `contexts` or `results` arrays, those
+/// arrays are trimmed first before dropping whole records. The `content` and
+/// `content_buffer` payload bytes are **never** edited (§8.4).
+///
+/// Returns the (possibly trimmed) records with `budget_trimmed` set on the
+/// last record if trimming occurred.
+pub fn apply_budget(mut records: Vec<Record>, budget: usize) -> Vec<Record> {
+    let total_tokens: usize = records
+        .iter()
+        .map(|r| estimate_tokens(serde_json::to_string(r).unwrap_or_default().len()))
+        .sum();
+
+    if total_tokens <= budget {
+        return records;
+    }
+
+    // Strategy: trim arrays on large records first (contexts, locations, results),
+    // then drop whole records from the end as a last resort.
+    loop {
+        let current: usize = records
+            .iter()
+            .map(|r| estimate_tokens(serde_json::to_string(r).unwrap_or_default().len()))
+            .sum();
+        if current <= budget || records.is_empty() {
+            break;
+        }
+
+        // Find the largest array and trim it.
+        let mut trimmed_any = false;
+        for rec in records.iter_mut().rev() {
+            if rec.contexts.len() > 1 {
+                rec.contexts.pop();
+                rec.budget_trimmed = true;
+                trimmed_any = true;
+                break;
+            }
+            if rec.locations.len() > 10 {
+                rec.locations.truncate(rec.locations.len() / 2);
+                rec.budget_trimmed = true;
+                trimmed_any = true;
+                break;
+            }
+            if rec.results.len() > 1 {
+                rec.results.pop();
+                rec.budget_trimmed = true;
+                trimmed_any = true;
+                break;
+            }
+            if rec.candidates.len() > 3 {
+                rec.candidates.truncate(rec.candidates.len() / 2);
+                rec.budget_trimmed = true;
+                trimmed_any = true;
+                break;
+            }
+        }
+        if !trimmed_any {
+            // No arrays left to trim — drop the last record.
+            if records.len() > 1 {
+                records.pop();
+                if let Some(last) = records.last_mut() {
+                    last.budget_trimmed = true;
+                    last.message = Some(
+                        "Budget trimmed: some results were dropped to fit token budget.".to_string(),
+                    );
+                }
+            } else {
+                // Single record left — mark it and stop.
+                records[0].budget_trimmed = true;
+                records[0].message = Some(
+                    "Budget trimmed: result was reduced to fit token budget.".to_string(),
+                );
+                break;
+            }
+        }
+    }
+    records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_tokens_reasonable() {
+        // 100 chars should be ~30 tokens (100/3.3)
+        let t = estimate_tokens(100);
+        assert!((28..=35).contains(&t), "got {t}");
+    }
+
+    #[test]
+    fn estimate_tokens_zero() {
+        assert_eq!(estimate_tokens(0), 0);
+    }
+
+    #[test]
+    fn budget_no_trim_when_under() {
+        let rec = Record::not_found("find-def", "foo");
+        let records = vec![rec];
+        let result = apply_budget(records.clone(), 10000);
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].budget_trimmed);
+    }
+
+    #[test]
+    fn budget_trims_large_locations() {
+        let mut rec = Record::not_found("find-refs", "foo");
+        rec.locations = (0..200)
+            .map(|i| RefLocation {
+                file: format!("/path/to/file_{i}.cpp"),
+                line: i,
+            })
+            .collect();
+        let original_len = rec.locations.len();
+        let result = apply_budget(vec![rec], 50);
+        assert!(result[0].locations.len() < original_len);
+        assert!(result[0].budget_trimmed);
+    }
+
+    #[test]
+    fn budget_drops_records_as_last_resort() {
+        let records: Vec<Record> = (0..10)
+            .map(|i| {
+                let mut r = Record::not_found("find-def", &format!("target_{i}"));
+                r.content = Some("x".repeat(500));
+                r
+            })
+            .collect();
+        let result = apply_budget(records, 100);
+        assert!(result.len() < 10);
+        assert!(result.last().unwrap().budget_trimmed);
+    }
+
+    #[test]
+    fn bundle_writer_emits_token_count() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf, Format::Bundle, false);
+            let rec = Record::not_found("find-def", "foo");
+            w.write(&rec).unwrap();
+            w.finish().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("```json"));
+        assert!(out.contains("// ~"));
+        assert!(out.contains("tokens"));
+    }
+
+    #[test]
+    fn bundle_writer_with_legend() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf, Format::Bundle, true);
+            let rec = Record::not_found("find-def", "foo");
+            w.write(&rec).unwrap();
+            w.finish().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("legend:"));
     }
 }

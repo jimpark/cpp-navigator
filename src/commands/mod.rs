@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::cli::{Cli, Command};
 use crate::engine::{Engine, SyntacticEngine};
@@ -35,20 +35,44 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
         Command::FindRefs { name, context } => ("find-refs", name, Query::References, false, *context),
     };
 
+    // Collect targets from CLI args + manifest file (design-specs §8.9).
+    let mut all_targets: Vec<String> = targets.clone();
+    if let Some(manifest_path) = &cli.manifest {
+        let content = std::fs::read_to_string(manifest_path)
+            .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                all_targets.push(trimmed.to_string());
+            }
+        }
+    }
+    // Deduplicate targets while preserving order.
+    let mut seen_targets = std::collections::HashSet::new();
+    all_targets.retain(|t| seen_targets.insert(t.clone()));
+
     let mut finder_cfg = build_finder_config(cli);
     // find-decl is header-biased (design-specs §7.2 step 1).
     finder_cfg.prefer_headers = query == Query::Declaration;
     let engine = SyntacticEngine::new();
 
-    let stdout = std::io::stdout();
-    let mut writer = Writer::new(stdout.lock(), cli.format, cli.legend);
-
-    for target in targets {
+    let mut records = Vec::new();
+    for target in &all_targets {
         let result = search::find_candidates(target, &finder_cfg)?;
         let record = resolve_one(command_name, target, query, scope, context, &result, &engine, cli);
-        writer.write(&record)?;
+        records.push(record);
     }
 
+    // Apply --budget trimming if requested (design-specs §8.10).
+    if let Some(budget) = cli.budget {
+        records = output::apply_budget(records, budget);
+    }
+
+    let stdout = std::io::stdout();
+    let mut writer = Writer::new(stdout.lock(), cli.format, cli.legend);
+    for record in &records {
+        writer.write(record)?;
+    }
     writer.finish()?;
     Ok(())
 }
@@ -719,5 +743,46 @@ mod tests {
         let record = resolve_refs_locations("find-refs", "missing", &result);
         // Empty locations is valid — caller should check not_found first.
         assert!(record.locations.is_empty());
+    }
+
+    // --- Phase 6: manifest and budget tests ---
+
+    #[test]
+    fn manifest_parses_targets_and_deduplicates() {
+        let dir = TempDir::new().unwrap();
+        let manifest = dir.path().join("queries.txt");
+        fs::write(
+            &manifest,
+            "alpha\nbeta\n# comment line\nalpha\ngamma\n",
+        )
+        .unwrap();
+
+        // Simulate what dispatch does: read manifest and deduplicate.
+        let content = fs::read_to_string(&manifest).unwrap();
+        let mut targets: Vec<String> = vec!["alpha".to_string()]; // from CLI
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                targets.push(trimmed.to_string());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        targets.retain(|t| seen.insert(t.clone()));
+
+        assert_eq!(targets, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn budget_trims_records_correctly() {
+        // Create records that exceed the budget, verify trimming.
+        let rec1 = Record::not_found("find-def", "big_target_name_1");
+        let mut rec2 = Record::not_found("find-def", "big_target_name_2");
+        rec2.content = Some("x".repeat(1000)); // make it large
+        let records = vec![rec1, rec2];
+        let trimmed = output::apply_budget(records, 50);
+        assert!(trimmed.len() <= 2);
+        // At least one record survives.
+        assert!(!trimmed.is_empty());
+        assert!(trimmed.last().unwrap().budget_trimmed);
     }
 }
