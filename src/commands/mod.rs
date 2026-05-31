@@ -14,6 +14,8 @@ use anyhow::{Context, Result};
 
 use crate::cli::{Cli, Command};
 use crate::engine::{Engine, SyntacticEngine};
+#[cfg(feature = "semantic")]
+use crate::engine::SemanticEngine;
 use crate::model::{Kind, Resolution};
 use crate::output::{self, Record, RefContext, RefLocation, TextWindow, Writer};
 use crate::search::{self, FinderConfig, FinderResult, DEFAULT_EXTENSIONS};
@@ -54,12 +56,39 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
     let mut finder_cfg = build_finder_config(cli);
     // find-decl is header-biased (design-specs §7.2 step 1).
     finder_cfg.prefer_headers = query == Query::Declaration;
-    let engine = SyntacticEngine::new();
+
+    // Select engine: --semantic opts into libclang Stage 2 when the feature is
+    // compiled in and a compile_commands.json is available (design-specs §4).
+    let syntactic = SyntacticEngine::new();
+    #[cfg(feature = "semantic")]
+    let semantic;
+    #[cfg(feature = "semantic")]
+    let engine: &dyn Engine = if cli.semantic {
+        let db_path = cli
+            .compile_db
+            .clone()
+            .unwrap_or_else(|| {
+                cli.root.first().cloned().unwrap_or_else(|| PathBuf::from("."))
+            });
+        semantic = SemanticEngine::new(db_path);
+        &semantic
+    } else {
+        &syntactic
+    };
+    #[cfg(not(feature = "semantic"))]
+    let engine: &dyn Engine = {
+        if cli.semantic && !cli.quiet {
+            eprintln!(
+                "cpp-navigator: --semantic requires a build with `--features semantic`; using tree-sitter."
+            );
+        }
+        &syntactic
+    };
 
     let mut records = Vec::new();
     for target in &all_targets {
         let result = search::find_candidates(target, &finder_cfg)?;
-        let record = resolve_one(command_name, target, query, scope, context, &result, &engine, cli);
+        let record = resolve_one(command_name, target, query, scope, context, &result, engine, cli);
         records.push(record);
     }
 
@@ -86,7 +115,7 @@ fn resolve_one(
     scope: bool,
     context: bool,
     result: &FinderResult,
-    engine: &SyntacticEngine,
+    engine: &dyn Engine,
     cli: &Cli,
 ) -> Record {
     if result.candidates.is_empty() {
@@ -102,6 +131,19 @@ fn resolve_one(
         Query::Definition => engine.definitions(target, &result.candidates),
         Query::Declaration => engine.declarations(target, &result.candidates),
         Query::References => unreachable!(),
+    };
+
+    // Semantic engine may return empty when compile_commands.json is absent;
+    // fall back to the syntactic engine in that case (design-specs §4).
+    let resolutions = if resolutions.is_empty() && engine.name() != "tree-sitter" {
+        let syntactic = SyntacticEngine::new();
+        match query {
+            Query::Definition => syntactic.definitions(target, &result.candidates),
+            Query::Declaration => syntactic.declarations(target, &result.candidates),
+            Query::References => unreachable!(),
+        }
+    } else {
+        resolutions
     };
 
     match resolutions.len() {
@@ -153,7 +195,7 @@ fn resolve_refs(
     target: &str,
     context: bool,
     result: &FinderResult,
-    engine: &SyntacticEngine,
+    engine: &dyn Engine,
     cli: &Cli,
 ) -> Record {
     if context {
@@ -234,7 +276,7 @@ fn resolution_type(query: Query, kind: Kind) -> String {
 /// `template`) span, re-slicing `content` from disk so the byte-fidelity
 /// contract (§8.4) holds for the wider span. Returns `None` when the match is
 /// not lexically inside a class/struct, leaving the member result unchanged.
-fn expand_to_class_scope(engine: &SyntacticEngine, r: &Resolution) -> Option<Resolution> {
+fn expand_to_class_scope(engine: &dyn Engine, r: &Resolution) -> Option<Resolution> {
     let span = engine.enclosing_class_scope(&r.source_ref.file_path, r.source_ref.span.start_byte)?;
     let src = std::fs::read(&r.source_ref.file_path).ok()?;
     if span.end_byte > src.len() || span.start_byte > span.end_byte {

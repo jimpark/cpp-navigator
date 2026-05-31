@@ -538,4 +538,89 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("legend:"));
     }
+
+    /// JSON Schema structural validation: every Record emitted via serde_json
+    /// must contain the required envelope fields and a valid schema_version.
+    #[test]
+    fn schema_version_1_0_envelope_fields() {
+        // Test all status variants to ensure schema_version + envelope always present.
+        let records = vec![
+            Record::not_found("find-def", "missing"),
+            Record::resolved("find-def", "foo", "definition", &crate::model::Resolution {
+                symbol: crate::model::Symbol {
+                    name: "foo".to_string(),
+                    qualified_name: Some("ns::foo".to_string()),
+                    kind: crate::model::Kind::Function,
+                    signature: None,
+                    type_spelling: None,
+                    doc: None,
+                },
+                source_ref: crate::model::SourceRef {
+                    file_path: std::path::PathBuf::from("/tmp/a.cpp"),
+                    span: crate::model::Span {
+                        start_byte: 0,
+                        end_byte: 10,
+                        start_line: 1,
+                        end_line: 1,
+                        start_col: 0,
+                        end_col: 10,
+                    },
+                },
+                content_bytes: b"int foo() {}".to_vec(),
+                engine: "tree-sitter".to_string(),
+                confidence: 0.9,
+                status: crate::model::Status::Resolved,
+            }),
+            Record::ambiguous("find-def", "bar", vec![
+                Candidate { file_path: "/a.h".to_string(), line: 1, snippet: None },
+                Candidate { file_path: "/b.h".to_string(), line: 2, snippet: None },
+            ]),
+            Record::references("find-refs", "baz", vec![
+                RefLocation { file: "/x.cpp".to_string(), line: 10 },
+            ], false),
+        ];
+
+        for rec in &records {
+            let json_str = serde_json::to_string(rec).unwrap();
+            let val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+            let obj = val.as_object().unwrap();
+
+            // Required envelope fields (design-specs §8).
+            assert_eq!(obj["schema_version"].as_str().unwrap(), "1.0");
+            assert_eq!(obj["tool"].as_str().unwrap(), "cpp-navigator");
+            assert!(obj.contains_key("command"), "missing 'command'");
+            assert!(obj.contains_key("target"), "missing 'target'");
+            assert!(obj.contains_key("status"), "missing 'status'");
+            assert!(obj.contains_key("resolution_type"), "missing 'resolution_type'");
+
+            // Status must be one of the allowed values.
+            let status = obj["status"].as_str().unwrap();
+            assert!(
+                ["resolved", "ambiguous", "fallback", "not_found"].contains(&status),
+                "invalid status: {status}"
+            );
+        }
+    }
+
+    /// Validates that omission-based serialization works: fields that are None
+    /// or empty Vec don't appear in the JSON output.
+    #[test]
+    fn schema_omits_empty_fields() {
+        let rec = Record::not_found("find-def", "gone");
+        let json_str = serde_json::to_string(&rec).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = val.as_object().unwrap();
+
+        // These should be absent for a not_found record.
+        assert!(!obj.contains_key("file_path"));
+        assert!(!obj.contains_key("content"));
+        assert!(!obj.contains_key("start_line"));
+        assert!(!obj.contains_key("end_line"));
+        assert!(!obj.contains_key("candidates"));
+        assert!(!obj.contains_key("locations"));
+        assert!(!obj.contains_key("contexts"));
+        assert!(!obj.contains_key("results"));
+        assert!(!obj.contains_key("truncated"));
+        assert!(!obj.contains_key("budget_trimmed"));
+    }
 }

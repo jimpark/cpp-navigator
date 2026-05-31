@@ -255,7 +255,7 @@ one paste-able block under the token cap. Tests + clippy clean.
 
 ---
 
-## Phase 7 — Stage 2 libclang + hardening
+## Phase 7 — Stage 2 libclang + hardening ✅
 
 **Goal:** the opt-in precision backend and the guarantees that survive review.
 

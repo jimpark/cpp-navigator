@@ -13,6 +13,11 @@ use crate::search::Candidate;
 mod syntactic;
 pub use syntactic::SyntacticEngine;
 
+#[cfg(feature = "semantic")]
+mod semantic;
+#[cfg(feature = "semantic")]
+pub use semantic::SemanticEngine;
+
 /// Common interface over the syntactic and semantic backends.
 pub trait Engine {
     /// Human/log name, e.g. `"tree-sitter"` or `"libclang"`.
