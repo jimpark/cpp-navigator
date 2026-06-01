@@ -17,16 +17,59 @@ use std::path::Path;
 use rayon::prelude::*;
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::engine::macros;
 use crate::engine::Engine;
 use crate::model::{Kind, Resolution, SourceRef, Span, Status, Symbol};
 use crate::search::Candidate;
 
 /// tree-sitter syntactic backend.
-pub struct SyntacticEngine;
+pub struct SyntacticEngine {
+    /// Macros blanked at every occurrence (`--empty-macro`): full `-DNAME=`
+    /// semantics; trusted because the user named them explicitly.
+    global_macros: HashSet<String>,
+    /// Macros blanked only in annotation position (`TYPE MACRO NAME (`).
+    /// Confirmed via project-wide `#define` discovery (plus each file's own
+    /// `#define`s, harvested at parse time). See [`macros`].
+    annotation_macros: HashSet<String>,
+}
 
 impl SyntacticEngine {
     pub fn new() -> Self {
-        SyntacticEngine
+        SyntacticEngine {
+            global_macros: HashSet::new(),
+            annotation_macros: HashSet::new(),
+        }
+    }
+
+    /// Build an engine that blanks the given user macro names everywhere (and,
+    /// in annotation position, treats them as confirmed). Convenience for the
+    /// `--empty-macro`-only path and tests.
+    pub fn with_empty_macros<I>(names: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let global: HashSet<String> = names.into_iter().collect();
+        SyntacticEngine {
+            annotation_macros: global.clone(),
+            global_macros: global,
+        }
+    }
+
+    /// Build an engine with explicit `global` (blank-everywhere) macros and
+    /// `discovered` annotation macros (blanked only in annotation position).
+    /// The annotation set is the union of both so user macros are also confirmed.
+    pub fn with_macros<G, D>(global: G, discovered: D) -> Self
+    where
+        G: IntoIterator<Item = String>,
+        D: IntoIterator<Item = String>,
+    {
+        let global: HashSet<String> = global.into_iter().collect();
+        let mut annotation: HashSet<String> = discovered.into_iter().collect();
+        annotation.extend(global.iter().cloned());
+        SyntacticEngine {
+            global_macros: global,
+            annotation_macros: annotation,
+        }
     }
 }
 
@@ -46,16 +89,16 @@ impl Engine for SyntacticEngine {
     }
 
     fn definitions(&self, target: &str, candidates: &[Candidate]) -> Vec<Resolution> {
-        run_over_files(target, candidates, Mode::Definition)
+        run_over_files(target, candidates, Mode::Definition, self)
     }
 
     fn declarations(&self, target: &str, candidates: &[Candidate]) -> Vec<Resolution> {
-        run_over_files(target, candidates, Mode::Declaration)
+        run_over_files(target, candidates, Mode::Declaration, self)
     }
 
     fn enclosing_scope(&self, file: &Path, byte_offset: usize) -> Option<Span> {
         let src = std::fs::read(file).ok()?;
-        let tree = parse(&src)?;
+        let tree = parse_recover(&src, self)?;
         let root = tree.root_node();
         let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
         // Walk up to the nearest function/template enclosure.
@@ -74,7 +117,7 @@ impl Engine for SyntacticEngine {
 
     fn enclosing_class_scope(&self, file: &Path, byte_offset: usize) -> Option<Span> {
         let src = std::fs::read(file).ok()?;
-        let tree = parse(&src)?;
+        let tree = parse_recover(&src, self)?;
         let root = tree.root_node();
         let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
         // Walk up to the nearest class/struct definition. Expand to a wrapping
@@ -108,12 +151,59 @@ fn parse(src: &[u8]) -> Option<Tree> {
     parser.parse(src, None)
 }
 
+/// Blank confirmed macros in `src` for `eng`, harvesting this file's own
+/// `#define`s into the annotation set first. Length-preserving; `None` if
+/// nothing was blanked.
+fn neutralize_for(eng: &SyntacticEngine, src: &[u8]) -> Option<Vec<u8>> {
+    let mut annotation = eng.annotation_macros.clone();
+    macros::collect_defines(src, &mut annotation);
+    macros::neutralize(src, &eng.global_macros, &annotation)
+}
+
+/// Parse `src`, recovering from annotation-macro damage when present.
+///
+/// If the first parse has errors and blanking confirmed macros yields a strictly
+/// cleaner parse, the recovered tree is returned instead. Blanking is
+/// length-preserving (see [`macros`]), so the returned tree's byte offsets still
+/// index the *original* `src` — callers must continue slicing `src`, never the
+/// blanked buffer. Used for single-result lookups (enclosing scopes); the match
+/// walk replaces with the cleaner parse instead (see [`matches_in_file`]).
+fn parse_recover(src: &[u8], eng: &SyntacticEngine) -> Option<Tree> {
+    let tree = parse(src)?;
+    if !tree.root_node().has_error() {
+        return Some(tree);
+    }
+    if let Some(neutralized) = neutralize_for(eng, src)
+        && let Some(recovered) = parse(&neutralized)
+        && error_count(recovered.root_node()) < error_count(tree.root_node())
+    {
+        return Some(recovered);
+    }
+    Some(tree)
+}
+
+/// Count `ERROR`/`MISSING` nodes in a subtree. Only called on trees already
+/// flagged `has_error()`, so the full walk is rare.
+fn error_count(node: Node) -> usize {
+    let mut n = usize::from(node.is_error() || node.is_missing());
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        n += error_count(child);
+    }
+    n
+}
+
 /// Parse every distinct candidate file (in parallel) and merge matches.
 ///
 /// The candidate line is only a prefilter hint; we search the whole parsed file
 /// for the name. Results are deduplicated by exact span and ordered
 /// deterministically (file path, then start byte) for stable output.
-fn run_over_files(target: &str, candidates: &[Candidate], mode: Mode) -> Vec<Resolution> {
+fn run_over_files(
+    target: &str,
+    candidates: &[Candidate],
+    mode: Mode,
+    eng: &SyntacticEngine,
+) -> Vec<Resolution> {
     // Distinct files, preserving the finder's deterministic order.
     let mut seen = HashSet::new();
     let files: Vec<&Path> = candidates
@@ -124,7 +214,7 @@ fn run_over_files(target: &str, candidates: &[Candidate], mode: Mode) -> Vec<Res
 
     let mut resolutions: Vec<Resolution> = files
         .par_iter()
-        .flat_map_iter(|path| matches_in_file(path, target, mode))
+        .flat_map_iter(|path| matches_in_file(path, target, mode, eng))
         .collect();
 
     resolutions.sort_by(|a, b| {
@@ -142,7 +232,23 @@ fn run_over_files(target: &str, candidates: &[Candidate], mode: Mode) -> Vec<Res
 }
 
 /// Collect all matching resolutions within a single file.
-fn matches_in_file(path: &Path, target: &str, mode: Mode) -> Vec<Resolution> {
+///
+/// When the first parse has errors (commonly an annotation macro between the
+/// return type and the function name — dllimport/export style — which
+/// tree-sitter has no preprocessor to expand, dropping or mangling overloads),
+/// the macros are blanked and the file is re-parsed. If that yields a strictly
+/// cleaner parse its matches *replace* the first parse's: the recovered tree is
+/// a superset that reports each overload as one clean node, so unioning would
+/// double-count an overload the broken parse had already matched (with a
+/// different, narrower span). Blanking is length-preserving, so the recovered
+/// tree shares the original byte coordinates and we always slice the original
+/// `src` for reported text — the macro stays visible in output.
+fn matches_in_file(
+    path: &Path,
+    target: &str,
+    mode: Mode,
+    eng: &SyntacticEngine,
+) -> Vec<Resolution> {
     let src = match std::fs::read(path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -151,6 +257,17 @@ fn matches_in_file(path: &Path, target: &str, mode: Mode) -> Vec<Resolution> {
         Some(t) => t,
         None => return Vec::new(),
     };
+
+    if tree.root_node().has_error()
+        && let Some(neutralized) = neutralize_for(eng, &src)
+        && let Some(recovered) = parse(&neutralized)
+        && error_count(recovered.root_node()) < error_count(tree.root_node())
+    {
+        let mut out = Vec::new();
+        walk(recovered.root_node(), &src, target, mode, path, &mut out);
+        return out;
+    }
+
     let mut out = Vec::new();
     walk(tree.root_node(), &src, target, mode, path, &mut out);
     out
@@ -289,23 +406,28 @@ fn has_initializer(node: Node) -> bool {
 
 /// Does a `declaration`/`field_declaration` declare a function (prototype)?
 fn is_function_prototype(node: Node) -> bool {
-    let Some(decl) = node.child_by_field_name("declarator") else {
-        return false;
-    };
-    // Peel pointer/reference wrappers down to a function_declarator.
-    let mut cur = decl;
-    loop {
-        match cur.kind() {
-            "function_declarator" => return true,
-            "pointer_declarator" | "reference_declarator" | "parenthesized_declarator" => {
-                match inner_declarator(cur) {
-                    Some(inner) => cur = inner,
-                    None => return false,
+    if let Some(decl) = node.child_by_field_name("declarator") {
+        // Peel pointer/reference wrappers down to a function_declarator.
+        let mut cur = decl;
+        loop {
+            match cur.kind() {
+                "function_declarator" => return true,
+                "pointer_declarator" | "reference_declarator" | "parenthesized_declarator" => {
+                    match inner_declarator(cur) {
+                        Some(inner) => cur = inner,
+                        None => break,
+                    }
                 }
+                _ => break,
             }
-            _ => return false,
         }
     }
+    // Fallback: scan direct children for a function_declarator.
+    // tree-sitter-cpp may not place it under the `declarator` field when an
+    // unknown macro annotation (e.g. `LIB_API`) sits between the
+    // return type and the function name.
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|c| c.kind() == "function_declarator")
 }
 
 /// The node whose span we report — expands a definition/declaration to the
@@ -325,8 +447,26 @@ fn name_node(node: Node) -> Option<Node> {
     match node.kind() {
         "class_specifier" | "struct_specifier" => node.child_by_field_name("name"),
         _ => {
-            let decl = node.child_by_field_name("declarator")?;
-            innermost_name(decl)
+            if let Some(decl) = node.child_by_field_name("declarator")
+                && let Some(name) = innermost_name(decl)
+            {
+                return Some(name);
+            }
+            // Fallback: scan direct children for a function_declarator whose
+            // inner name we can extract. Handles declarations with a macro
+            // annotation between the return type and function name, e.g.:
+            //   static CWideStr LIB_API Encode(...)
+            // where tree-sitter may not route the function_declarator through
+            // the `declarator` field.
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "function_declarator"
+                    && let Some(name) = innermost_name(child)
+                {
+                    return Some(name);
+                }
+            }
+            None
         }
     }
 }
@@ -553,28 +693,77 @@ fn find_function_declarator(node: Node) -> Option<Node> {
 
 /// Collect the contiguous comment block immediately above `node` (design-specs
 /// §7.2: line `//` runs or `/* ... */` blocks). Returns `None` if absent.
+///
+/// When a declaration uses a macro annotation between the return type and the
+/// function name (e.g. `static CWideStr LIB_API Func(...)`),
+/// tree-sitter-cpp splits it into two sibling nodes at the same source line:
+/// a `field_declaration` for the type/macro prefix and a `declaration` for the
+/// function. The engine matches on the `declaration` node; to find the doc
+/// comment we must step over the same-row `field_declaration` fragment that
+/// sits between the comment and our node.
 fn leading_doc(node: Node, src: &[u8]) -> Option<String> {
-    let mut comments: Vec<String> = Vec::new();
-    let mut anchor_row = node.start_position().row;
-    let mut prev = node.prev_sibling();
-    while let Some(p) = prev {
-        if p.kind() != "comment" {
-            break;
+    let node_start_row = node.start_position().row;
+
+    // Strategy 1: prev_sibling() chain, stepping over any same-row
+    // field_declaration that is the macro-prefix fragment of our declaration.
+    {
+        let mut comments = Vec::new();
+        let mut anchor_row = node_start_row;
+        let mut prev = node.prev_sibling();
+        while let Some(p) = prev {
+            match p.kind() {
+                "comment" => {
+                    if p.end_position().row + 1 < anchor_row { break; }
+                    comments.push(text(p, src));
+                    anchor_row = p.start_position().row;
+                    prev = p.prev_sibling();
+                }
+                "field_declaration" if p.start_position().row == node_start_row => {
+                    // Same-line fragment (type/macro prefix) — step over it.
+                    prev = p.prev_sibling();
+                }
+                _ => break,
+            }
         }
-        // Require adjacency: the comment must sit directly above (no blank gap).
-        if p.end_position().row + 1 < anchor_row {
-            break;
+        if !comments.is_empty() {
+            comments.reverse();
+            return Some(comments.join("\n"));
         }
-        comments.push(text(p, src));
-        anchor_row = p.start_position().row;
-        prev = p.prev_sibling();
     }
-    if comments.is_empty() {
-        None
-    } else {
-        comments.reverse();
-        Some(comments.join("\n"))
+
+    // Strategy 2: parent-children scan — same step-over logic applied to the
+    // ordered siblings list. Serves as a fallback when prev_sibling() skips
+    // extra nodes on certain tree-sitter versions.
+    if let Some(parent) = node.parent() {
+        let mut cursor = parent.walk();
+        let siblings: Vec<_> = parent.children(&mut cursor).collect();
+        if let Some(idx) = siblings.iter().position(|s| s.id() == node.id()) {
+            let mut comments = Vec::new();
+            let mut anchor_row = node_start_row;
+            let mut i = idx;
+            while i > 0 {
+                i -= 1;
+                let s = siblings[i];
+                match s.kind() {
+                    "comment" => {
+                        if s.end_position().row + 1 < anchor_row { break; }
+                        comments.push(text(s, src));
+                        anchor_row = s.start_position().row;
+                    }
+                    "field_declaration" if s.start_position().row == node_start_row => {
+                        // Step over same-line type/macro prefix fragment.
+                    }
+                    _ => break,
+                }
+            }
+            if !comments.is_empty() {
+                comments.reverse();
+                return Some(comments.join("\n"));
+            }
+        }
     }
+
+    None
 }
 
 /// Verbatim text of a node.
@@ -851,5 +1040,154 @@ mod tests {
         let res = eng.declarations("Compute", &candidates_for(&p));
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].symbol.type_spelling.as_deref(), Some("double(int)"));
+    }
+
+    // --- macro-annotation overload tests (e.g. LIB_API-style) ---
+
+    #[test]
+    fn declarations_finds_single_line_macro_annotated_overloads() {
+        // Reproduces the pattern: `static RetType MACRO FuncName(params);`
+        // where MACRO is an unknown annotation that may sit between the return
+        // type and the function_declarator in tree-sitter's parse tree.
+        let dir = TempDir::new().unwrap();
+        let body = concat!(
+            "#define MOCK_EXPORT __declspec(dllexport)\n",
+            "class Coder {\n",
+            "public:\n",
+            "    static int MOCK_EXPORT Convert(const char* a, bool flag = false);\n",
+            "    static int MOCK_EXPORT Convert(const char* a, int n, bool flag = false);\n",
+            "};\n",
+        );
+        let p = write(&dir, "coder.h", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("Convert", &candidates_for(&p));
+        assert_eq!(res.len(), 2, "both macro-annotated overloads should be found");
+        let names: Vec<_> = res.iter().map(|r| r.symbol.name.as_str()).collect();
+        assert!(names.iter().all(|&n| n == "Convert"));
+    }
+
+    #[test]
+    fn declarations_finds_multiline_macro_annotated_overloads() {
+        // Two overloads in the same class, both with a macro annotation,
+        // multi-line parameter lists, and default values on split lines.
+        let dir = TempDir::new().unwrap();
+        let body = concat!(
+            "#define MOCK_EXPORT __declspec(dllexport)\n",
+            "class Coder {\n",
+            "public:\n",
+            "    static int MOCK_EXPORT Convert(\n",
+            "        const char* session,\n",
+            "        const char* input,\n",
+            "        bool useEntities,\n",
+            "        int lang = 0,\n",
+            "        int mode =\n",
+            "            DefaultMode,\n",
+            "        bool urduMode = false);\n",
+            "\n",
+            "    static int MOCK_EXPORT Convert(\n",
+            "        const char* input,\n",
+            "        bool useEntities,\n",
+            "        int lang = 0,\n",
+            "        int mode =\n",
+            "            DefaultMode,\n",
+            "        bool urduMode = false);\n",
+            "};\n",
+        );
+        let p = write(&dir, "coder.h", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("Convert", &candidates_for(&p));
+        assert_eq!(res.len(), 2, "both multiline macro-annotated overloads should be found");
+    }
+
+    #[test]
+    fn declarations_finds_macro_annotated_overload_with_doxygen_comments() {
+        // Full pattern: Doxygen block comment above each overload, macro
+        // annotation, multi-line params.
+        let dir = TempDir::new().unwrap();
+        let body = concat!(
+            "#define MOCK_EXPORT __declspec(dllexport)\n",
+            "class Coder {\n",
+            "public:\n",
+            "    /**\n",
+            "     * Overload 1 — with session.\n",
+            "     * @param session The session.\n",
+            "     * @param input The input.\n",
+            "     */\n",
+            "    static int MOCK_EXPORT Convert(\n",
+            "        const char* session,\n",
+            "        const char* input);\n",
+            "\n",
+            "    /**\n",
+            "     * Overload 2 — default session.\n",
+            "     * @param input The input.\n",
+            "     */\n",
+            "    static int MOCK_EXPORT Convert(\n",
+            "        const char* input);\n",
+            "};\n",
+        );
+        let p = write(&dir, "coder.h", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("Convert", &candidates_for(&p));
+        assert_eq!(res.len(), 2, "both overloads with Doxygen comments should be found");
+        // Each result should carry its own doc comment.
+        for r in &res {
+            assert!(
+                r.symbol.doc.as_deref().unwrap_or("").contains("Overload"),
+                "expected doc comment, got {:?}", r.symbol.doc
+            );
+        }
+    }
+
+    #[test]
+    fn declarations_finds_pure_virtual_macro_annotated_overloads() {
+        // The key breaker: a pure-virtual interface with a dllimport/export macro
+        // between the return type and the name. tree-sitter reparses one `= 0`
+        // overload as a function_definition (skipped by find-decl) and wraps the
+        // macro of the other in an ERROR node — dropping an overload.
+        // Macro neutralization (via per-file #define harvest) recovers both.
+        let dir = TempDir::new().unwrap();
+        let body = concat!(
+            "#define LIB_API __declspec(dllimport)\n",
+            "class ICodec {\n",
+            "public:\n",
+            "    virtual CWideStr LIB_API Convert(const CStr& a) = 0;\n",
+            "    virtual CWideStr LIB_API Convert(const CStr& a, int n) = 0;\n",
+            "};\n",
+        );
+        let p = write(&dir, "icodec.h", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("Convert", &candidates_for(&p));
+        assert_eq!(res.len(), 2, "both pure-virtual macro overloads should be found");
+        // Byte-fidelity holds: each reported span re-slices from disk exactly,
+        // and the macro text remains visible (we slice the original, not the
+        // blanked buffer).
+        let disk = fs::read(&p).unwrap();
+        for r in &res {
+            let s = &r.source_ref.span;
+            assert_eq!(&disk[s.start_byte..s.end_byte], r.content_bytes.as_slice());
+            assert!(String::from_utf8_lossy(&r.content_bytes).contains("LIB_API"));
+        }
+    }
+
+    #[test]
+    fn empty_macro_config_recovers_mixed_case_annotation() {
+        // A mixed-case annotation macro the UPPER_CASE auto-detector won't catch;
+        // the user supplies it via `--empty-macro` (with_empty_macros). This
+        // form breaks the parse hard — plain resolution finds neither overload.
+        let dir = TempDir::new().unwrap();
+        let body = concat!(
+            "class ICodec {\n",
+            "public:\n",
+            "    virtual CWideStr Codec_Export Convert(const CStr& a) = 0;\n",
+            "    virtual CWideStr Codec_Export Convert(const CStr& a, int n) = 0;\n",
+            "};\n",
+        );
+        let p = write(&dir, "icodec.h", body);
+        // Without config, auto-detect (UPPER_CASE only) cannot recover it.
+        let plain = SyntacticEngine::new();
+        assert_eq!(plain.declarations("Convert", &candidates_for(&p)).len(), 0);
+        // With config, both overloads are recovered.
+        let eng = SyntacticEngine::with_empty_macros(["Codec_Export".to_string()]);
+        assert_eq!(eng.declarations("Convert", &candidates_for(&p)).len(), 2);
     }
 }

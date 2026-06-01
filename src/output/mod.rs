@@ -60,6 +60,19 @@ pub struct ResolvedResult {
     pub qualified_name: Option<String>,
 }
 
+/// One verbatim text window in a multi-hit fallback (design-specs §8.6).
+/// Emitted when the text-fallback rung has several distinct hits — typically
+/// overloads the engine could not structurally bound — so each occurrence is
+/// shown rather than just the first.
+#[derive(Clone, Debug, Serialize)]
+pub struct FallbackWindow {
+    pub file_path: String,
+    pub approximate_line: usize,
+    pub window_before: usize,
+    pub window_after: usize,
+    pub content_buffer: String,
+}
+
 /// A reference with its enclosing scope context (for --context mode).
 #[derive(Clone, Debug, Serialize)]
 pub struct RefContext {
@@ -132,6 +145,10 @@ pub struct Record {
     pub window_after: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_buffer: Option<String>,
+    /// Multiple fallback windows (one per distinct hit). Present instead of the
+    /// singular `content_buffer` fields when the fallback spans several hits.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<FallbackWindow>,
 
     // Cross-cutting markers ----------------------------------------------
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -170,6 +187,7 @@ impl Record {
             window_before: None,
             window_after: None,
             content_buffer: None,
+            windows: Vec::new(),
             truncated: false,
             budget_trimmed: false,
             message: None,
@@ -229,6 +247,21 @@ impl Record {
         r.window_before = Some(window.before);
         r.window_after = Some(window.after);
         r.content_buffer = Some(window.content_buffer);
+        r.message = Some(message.into());
+        r
+    }
+
+    /// A multi-hit text fallback: one verbatim window per distinct hit. Used
+    /// when grep found several occurrences (e.g. overloads) that no engine could
+    /// bound — so the caller sees every hit, not just the first.
+    pub fn fallback_multi(
+        command: &str,
+        target: &str,
+        windows: Vec<FallbackWindow>,
+        message: impl Into<String>,
+    ) -> Self {
+        let mut r = Record::new(command, target, Status::Fallback, "partial_resolution_fallback");
+        r.windows = windows;
         r.message = Some(message.into());
         r
     }
@@ -498,6 +531,22 @@ fn render_human(record: &Record, colors: bool) -> String {
                     Some(s) => out += &format!("  {}  {}\n", cyan(&loc), dim(s)),
                     None    => out += &format!("  {}\n", cyan(&loc)),
                 }
+            }
+        }
+        Status::Fallback if !record.windows.is_empty() => {
+            // Multi-hit fallback: one window per distinct occurrence.
+            if let Some(msg) = &record.message {
+                out += &format!("{}\n", dim(msg));
+            }
+            for (i, w) in record.windows.iter().enumerate() {
+                let loc = format!("{}  ~line {}", w.file_path, w.approximate_line);
+                out += &format!("\n[{}] {}\n\n", i + 1, cyan(&loc));
+                for line in w.content_buffer.lines() {
+                    out += &format!("    {line}\n");
+                }
+            }
+            if record.truncated {
+                out += &format!("{}\n", dim("(truncated — more hits omitted)"));
             }
         }
         Status::Fallback => {

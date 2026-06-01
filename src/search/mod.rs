@@ -270,6 +270,90 @@ fn run_search(target: &str, cfg: &FinderConfig) -> Result<FinderResult> {
     })
 }
 
+/// Sink collecting `#define` macro names from a single file's matching lines.
+struct DefineSink<'a> {
+    re: &'a regex::Regex,
+    names: Vec<String>,
+}
+
+impl Sink for DefineSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, m: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
+        if let Ok(line) = std::str::from_utf8(m.bytes())
+            && let Some(caps) = self.re.captures(line)
+        {
+            self.names.push(caps[1].to_string());
+        }
+        Ok(true)
+    }
+}
+
+/// Harvest the names of all `#define`d macros under the search roots.
+///
+/// Used to *confirm* which annotation-position tokens are genuinely macros
+/// before the syntactic engine blanks them (design: only blank proven macros,
+/// never a real type or constant). Reuses the same ignore-aware parallel walk as
+/// [`find_candidates`]; best-effort, so unreadable files are skipped silently.
+pub fn discover_defines(cfg: &FinderConfig) -> HashSet<String> {
+    // Line prefilter (fast, ripgrep matcher); the capture regex extracts the
+    // name from each matching line.
+    let matcher = match RegexMatcher::new(r"^\s*#\s*define\s+[A-Za-z_]") {
+        Ok(m) => m,
+        Err(_) => return HashSet::new(),
+    };
+    let name_re = match regex::Regex::new(r"#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)") {
+        Ok(r) => r,
+        Err(_) => return HashSet::new(),
+    };
+
+    let roots: Vec<PathBuf> = if cfg.roots.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        cfg.roots.clone()
+    };
+    let mut builder = WalkBuilder::new(&roots[0]);
+    for root in &roots[1..] {
+        builder.add(root);
+    }
+    builder.standard_filters(cfg.respect_ignore);
+    builder.require_git(false);
+    if let Some(n) = cfg.threads {
+        builder.threads(n);
+    }
+
+    let names = Mutex::new(HashSet::new());
+    let extensions = &cfg.extensions;
+    {
+        let names = &names;
+        let matcher = &matcher;
+        let name_re = &name_re;
+        builder.build_parallel().run(|| {
+            let mut searcher = SearcherBuilder::new().line_number(false).build();
+            Box::new(move |entry| {
+                let Ok(entry) = entry else {
+                    return WalkState::Continue;
+                };
+                let path = entry.path();
+                if !entry.file_type().is_some_and(|ft| ft.is_file())
+                    || !ext_allowed(path, extensions)
+                {
+                    return WalkState::Continue;
+                }
+                let mut sink = DefineSink { re: name_re, names: Vec::new() };
+                if searcher.search_path(matcher, path, &mut sink).is_err() {
+                    return WalkState::Continue;
+                }
+                if !sink.names.is_empty() {
+                    names.lock().unwrap().extend(sink.names);
+                }
+                WalkState::Continue
+            })
+        });
+    }
+    names.into_inner().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

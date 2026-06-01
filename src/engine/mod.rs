@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::model::{Resolution, Span};
 use crate::search::Candidate;
 
+pub(crate) mod macros;
 mod syntactic;
 pub use syntactic::SyntacticEngine;
 

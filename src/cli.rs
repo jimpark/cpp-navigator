@@ -89,6 +89,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub budget: Option<usize>,
 
+    /// Treat NAME as an empty annotation macro when parsing (like clang's
+    /// `-DNAME=`). Repeatable. Helps tree-sitter through dllimport/export and
+    /// calling-convention macros between a return type and a function name.
+    /// UPPER_CASE annotation macros are also detected automatically.
+    #[arg(long = "empty-macro", global = true, value_name = "NAME")]
+    pub empty_macro: Vec<String>,
+
     /// Suppress stderr diagnostics.
     #[arg(long, global = true)]
     pub quiet: bool,

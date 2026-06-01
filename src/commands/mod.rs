@@ -57,9 +57,30 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
     // find-decl is header-biased (design-specs §7.2 step 1).
     finder_cfg.prefer_headers = query == Query::Declaration;
 
+    // Confirm which annotation macros to blank by harvesting `#define` names
+    // across the roots (strict: only blank proven macros). Skipped for the
+    // non-parsing find-refs location path. Unioned with the user's --empty-macro.
+    let needs_macros = query != Query::References || context;
+    let discovered = if needs_macros {
+        let disc_cfg = FinderConfig {
+            prefer_headers: false,
+            ..finder_cfg.clone()
+        };
+        search::discover_defines(&disc_cfg)
+    } else {
+        std::collections::HashSet::new()
+    };
+    // Confirmed-macro set for the "unrecognized macro" hint (user ∪ discovered).
+    let confirmed: std::collections::HashSet<String> = cli
+        .empty_macro
+        .iter()
+        .cloned()
+        .chain(discovered.iter().cloned())
+        .collect();
+
     // Select engine: --semantic opts into libclang Stage 2 when the feature is
     // compiled in and a compile_commands.json is available (design-specs §4).
-    let syntactic = SyntacticEngine::new();
+    let syntactic = SyntacticEngine::with_macros(cli.empty_macro.clone(), discovered.clone());
     #[cfg(feature = "semantic")]
     let semantic;
     #[cfg(feature = "semantic")]
@@ -86,9 +107,18 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
     };
 
     let mut records = Vec::new();
+    // Annotation macros seen in candidate files that are NOT confirmed — likely
+    // hiding declarations. Collected only when a target under-resolves.
+    let mut unconfirmed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for target in &all_targets {
         let result = search::find_candidates(target, &finder_cfg)?;
-        let record = resolve_one(command_name, target, query, scope, context, &result, engine, cli);
+        let record =
+            resolve_one(command_name, target, query, scope, context, &result, engine, &discovered, cli);
+        if needs_macros
+            && matches!(record.status, output::Status::Fallback | output::Status::Ambiguous)
+        {
+            collect_unconfirmed_macros(&result, &confirmed, &mut unconfirmed);
+        }
         records.push(record);
     }
 
@@ -105,7 +135,42 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
         writer.write(record)?;
     }
     writer.finish()?;
+
+    // Strict-but-warn: a target under-resolved and the candidate files contain
+    // UPPER_CASE annotation macros we couldn't confirm via #define. Suggest
+    // --empty-macro so the user can opt them in.
+    if !unconfirmed.is_empty() && !cli.quiet {
+        let names: Vec<&str> = unconfirmed.iter().map(String::as_str).collect();
+        let flags: String = names.iter().map(|n| format!(" --empty-macro {n}")).collect();
+        eprintln!(
+            "cpp-navigator: note: unrecognized annotation macro(s) [{}] may be hiding \
+             declarations; if so, re-run with{}",
+            names.join(", "),
+            flags
+        );
+    }
     Ok(())
+}
+
+/// Scan distinct candidate files for UPPER_CASE annotation-position tokens that
+/// are not confirmed macros, accumulating them into `out`. Best-effort: a file
+/// that cannot be read is skipped.
+fn collect_unconfirmed_macros(
+    result: &FinderResult,
+    confirmed: &std::collections::HashSet<String>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    let mut seen_files = std::collections::HashSet::new();
+    for cand in &result.candidates {
+        if !seen_files.insert(cand.file_path.clone()) {
+            continue;
+        }
+        if let Ok(src) = std::fs::read(&cand.file_path) {
+            for name in crate::engine::macros::unconfirmed_annotations(&src, confirmed) {
+                out.insert(name);
+            }
+        }
+    }
 }
 
 /// Apply the degradation ladder to one target's candidate set.
@@ -118,6 +183,7 @@ fn resolve_one(
     context: bool,
     result: &FinderResult,
     engine: &dyn Engine,
+    discovered: &std::collections::HashSet<String>,
     cli: &Cli,
 ) -> Record {
     if result.candidates.is_empty() {
@@ -138,7 +204,7 @@ fn resolve_one(
     // Semantic engine may return empty when compile_commands.json is absent;
     // fall back to the syntactic engine in that case (design-specs §4).
     let resolutions = if resolutions.is_empty() && engine.name() != "tree-sitter" {
-        let syntactic = SyntacticEngine::new();
+        let syntactic = SyntacticEngine::with_macros(cli.empty_macro.clone(), discovered.clone());
         match query {
             Query::Definition => syntactic.definitions(target, &result.candidates),
             Query::Declaration => syntactic.declarations(target, &result.candidates),
@@ -152,7 +218,8 @@ fn resolve_one(
     // functions without prototypes), surface definitions so all overloads appear.
     let decl_used_defs = resolutions.is_empty() && query == Query::Declaration;
     let resolutions = if decl_used_defs {
-        SyntacticEngine::new().definitions(target, &result.candidates)
+        SyntacticEngine::with_macros(cli.empty_macro.clone(), discovered.clone())
+            .definitions(target, &result.candidates)
     } else {
         resolutions
     };
@@ -326,25 +393,61 @@ fn to_candidate(r: &Resolution) -> output::Candidate {
     }
 }
 
-/// Degrade to a verbatim ±window text buffer around the first textual hit
+/// Degrade to verbatim ±window text buffers around the textual hits
 /// (design-specs §8.6).
+///
+/// When grep found several distinct hits — typically overloads the engine could
+/// not structurally bound — a window is emitted for each (up to `--max-results`)
+/// so the caller sees every occurrence, not just the first. A single hit keeps
+/// the original single-window shape.
 fn text_fallback(command: &str, target: &str, result: &FinderResult, cli: &Cli) -> Record {
-    let hit = &result.candidates[0];
-    let (buffer, before, after) =
-        read_window(&hit.file_path, hit.line, cli.window).unwrap_or_else(|_| (hit.snippet.clone(), 0, 0));
-    let window = TextWindow {
-        file_path: hit.file_path.to_string_lossy().into_owned(),
-        approximate_line: hit.line,
-        before,
-        after,
-        content_buffer: buffer,
+    // Distinct (file, line) hits, in the finder's deterministic order.
+    let mut seen = std::collections::HashSet::new();
+    let hits: Vec<&search::Candidate> = result
+        .candidates
+        .iter()
+        .filter(|c| seen.insert((c.file_path.clone(), c.line)))
+        .collect();
+    let cap = cli.max_results.max(1);
+    let shown = hits.len().min(cap);
+
+    let to_window = |hit: &search::Candidate| {
+        let (buffer, before, after) = read_window(&hit.file_path, hit.line, cli.window)
+            .unwrap_or_else(|_| (hit.snippet.clone(), 0, 0));
+        (hit.file_path.to_string_lossy().into_owned(), hit.line, before, after, buffer)
     };
-    let msg = match command {
-        "find-refs" => "Reference locations as a raw text window.",
-        _ => "Semantic extraction unavailable for this target; returning raw text window.",
+
+    let mut rec = if shown <= 1 {
+        let hit = hits[0];
+        let (file_path, approximate_line, before, after, content_buffer) = to_window(hit);
+        let window = TextWindow { file_path, approximate_line, before, after, content_buffer };
+        let msg = match command {
+            "find-refs" => "Reference locations as a raw text window.".to_string(),
+            _ => "Semantic extraction unavailable for this target; returning raw text window."
+                .to_string(),
+        };
+        Record::fallback(command, target, window, msg)
+    } else {
+        let windows: Vec<output::FallbackWindow> = hits[..shown]
+            .iter()
+            .map(|hit| {
+                let (file_path, approximate_line, before, after, content_buffer) = to_window(hit);
+                output::FallbackWindow {
+                    file_path,
+                    approximate_line,
+                    window_before: before,
+                    window_after: after,
+                    content_buffer,
+                }
+            })
+            .collect();
+        let msg = format!(
+            "Engine could not bound this target; showing {shown} raw text window(s) \
+             around the grep hits."
+        );
+        Record::fallback_multi(command, target, windows, msg)
     };
-    let mut rec = Record::fallback(command, target, window, msg);
-    rec.truncated = result.truncated;
+    rec.truncated = result.truncated || hits.len() > shown;
     rec
 }
 
@@ -370,12 +473,44 @@ fn build_finder_config(cli: &Cli) -> FinderConfig {
     }
 }
 
+/// Scan backward from `hit_idx` (exclusive) to find the 0-based index of the
+/// first line of a C++ comment block that sits immediately above the hit with
+/// no intervening blank lines. Handles `//`, `///`, `//!` line comments and
+/// `/* ... */` / `/** ... */` block comments. Returns `hit_idx` when no
+/// comment precedes the hit.
+fn find_comment_block_start(lines: &[&str], hit_idx: usize) -> usize {
+    let mut start = hit_idx;
+    let mut i = hit_idx;
+    while i > 0 {
+        i -= 1;
+        let t = lines[i].trim();
+        if t.is_empty() {
+            break; // blank line ends the scan — don't absorb unrelated comments
+        } else if t.starts_with("//") {
+            start = i; // line comment (///, //!, //)
+        } else if t.starts_with("/*") {
+            start = i; // block comment opener: include and stop
+            break;
+        } else if t.starts_with('*') {
+            start = i; // interior or closing line of a block comment
+        } else {
+            break;
+        }
+    }
+    start
+}
+
 /// Read a verbatim window of `±window` lines around (1-based) `line`.
 ///
-/// Returns the joined text plus the actual number of lines included before and
-/// after the target (which can be smaller than `window` near file edges). The
-/// text is byte-faithful per line; only line splitting/rejoining occurs, with
-/// `\n` separators preserved between retained lines.
+/// The upward boundary is extended to capture any C++ comment block
+/// (`///`, `//!`, `//`, `/** ... */`) that sits immediately above the hit
+/// with no blank gap — so a 30-line Doxygen block is never truncated even
+/// when `window` is small. The downward boundary is always exactly `window`
+/// lines (clamped at EOF).
+///
+/// Returns the joined text plus the actual number of lines included before
+/// and after the target. Text is byte-faithful; only line splitting/rejoining
+/// occurs with `\n` separators.
 fn read_window(path: &PathBuf, line: usize, window: usize) -> Result<(String, usize, usize)> {
     let content = std::fs::read_to_string(path)?;
     let lines: Vec<&str> = content.lines().collect();
@@ -383,8 +518,11 @@ fn read_window(path: &PathBuf, line: usize, window: usize) -> Result<(String, us
         return Ok((String::new(), 0, 0));
     }
     let idx = line.saturating_sub(1).min(lines.len() - 1);
-    let start = idx.saturating_sub(window);
+    let window_start = idx.saturating_sub(window);
     let end = (idx + window + 1).min(lines.len());
+    // Extend upward to capture the full comment block above the hit.
+    let comment_start = find_comment_block_start(&lines, idx);
+    let start = comment_start.min(window_start);
     let before = idx - start;
     let after = end - idx - 1;
     let buffer = lines[start..end].join("\n");
@@ -417,6 +555,71 @@ mod tests {
         assert_eq!(before, 1);
         assert_eq!(after, 1);
         assert_eq!(buf, "l2\nl3\nl4");
+    }
+
+    #[test]
+    fn window_extends_for_line_comment_block() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.hpp");
+        let body = "/// Brief description.\n\
+                    /// @param x the value\n\
+                    void foo(int x);\n\
+                    void bar();\n";
+        fs::write(&p, body).unwrap();
+        // window=0 normally gives only the hit line; comment extension pulls
+        // in the 2-line doc block above.
+        let (buf, before, after) = read_window(&p, 3, 0).unwrap();
+        assert_eq!(before, 2, "should capture both comment lines");
+        assert_eq!(after, 0);
+        assert!(buf.contains("/// Brief description."));
+        assert!(buf.contains("/// @param x"));
+        assert!(buf.contains("void foo(int x);"));
+    }
+
+    #[test]
+    fn window_extends_for_block_comment() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.hpp");
+        let body = "/**\n\
+                    * @brief Allocates the pool.\n\
+                    * @param n pool size\n\
+                    */\n\
+                    void InitPool(size_t n);\n";
+        fs::write(&p, body).unwrap();
+        let (buf, before, after) = read_window(&p, 5, 0).unwrap();
+        assert_eq!(before, 4, "should capture all 4 comment lines");
+        assert_eq!(after, 0);
+        assert!(buf.starts_with("/**"));
+        assert!(buf.contains("@brief Allocates"));
+        assert!(buf.contains("void InitPool"));
+    }
+
+    #[test]
+    fn window_stops_at_blank_line_between_comments() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.hpp");
+        // The blank line separates an unrelated comment from the function's doc.
+        let body = "/// Unrelated comment.\n\
+                    \n\
+                    /// Relevant doc.\n\
+                    void foo();\n";
+        fs::write(&p, body).unwrap();
+        let (buf, before, after) = read_window(&p, 4, 0).unwrap();
+        assert_eq!(before, 1, "should capture only the adjacent comment");
+        assert_eq!(after, 0);
+        assert!(buf.contains("/// Relevant doc."));
+        assert!(!buf.contains("/// Unrelated comment."));
+    }
+
+    #[test]
+    fn window_no_extension_when_no_comment_above() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        fs::write(&p, "int x = 1;\nvoid foo();\n").unwrap();
+        let (buf, before, after) = read_window(&p, 2, 0).unwrap();
+        assert_eq!(before, 0, "code above, not a comment — no extension");
+        assert_eq!(after, 0);
+        assert_eq!(buf, "void foo();");
     }
 
     #[test]
@@ -563,6 +766,7 @@ mod tests {
             legend: false,
             manifest: None,
             budget: None,
+            empty_macro: vec![],
             quiet: false,
         };
         let record = resolve_refs("find-refs", "helper", true, &result, &eng, &cli);
@@ -608,6 +812,7 @@ mod tests {
             legend: false,
             manifest: None,
             budget: None,
+            empty_macro: vec![],
             quiet: false,
         };
         let record = resolve_refs("find-refs", "val", true, &result, &eng, &cli);
@@ -690,11 +895,11 @@ mod tests {
         assert_eq!(record.candidates.len(), 4);
     }
 
-    // --- Regression tests inspired by mepsplatform patterns ---
+    // --- Regression tests for real-world patterns ---
 
     #[test]
     fn refs_finds_method_calls_through_pointer() {
-        // Pattern from mepsplatform: m_pEdit->GetWindowText(str)
+        // Pattern: calls via pointer/member, e.g. m_pEdit->GetWindowText(str)
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("dlg.cpp");
         let body = concat!(
@@ -726,7 +931,7 @@ mod tests {
 
     #[test]
     fn refs_context_finds_method_in_class_member_function() {
-        // Pattern from mepsplatform: OnCreate defined as CMainFrame::OnCreate
+        // Pattern: out-of-line member definitions, e.g. CMainFrame::OnCreate
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("frame.cpp");
         let body = concat!(
@@ -765,6 +970,7 @@ mod tests {
             legend: false,
             manifest: None,
             budget: None,
+            empty_macro: vec![],
             quiet: false,
         };
         let record = resolve_refs("find-refs", "OnCreate", true, &result, &eng, &cli);
@@ -884,9 +1090,10 @@ mod tests {
             legend: false,
             manifest: None,
             budget: None,
+            empty_macro: vec![],
             quiet: false,
         };
-        let record = resolve_one("find-decl", "helper", Query::Declaration, false, false, &result, &eng, &cli);
+        let record = resolve_one("find-decl", "helper", Query::Declaration, false, false, &result, &eng, &std::collections::HashSet::new(), &cli);
         assert_eq!(record.status, output::Status::Resolved);
         assert!(record.content.as_deref().unwrap_or("").contains("helper"));
         assert!(record.message.as_deref().unwrap_or("").contains("No forward declaration"));
@@ -925,9 +1132,10 @@ mod tests {
             legend: false,
             manifest: None,
             budget: None,
+            empty_macro: vec![],
             quiet: false,
         };
-        let record = resolve_one("find-decl", "process", Query::Declaration, false, false, &result, &eng, &cli);
+        let record = resolve_one("find-decl", "process", Query::Declaration, false, false, &result, &eng, &std::collections::HashSet::new(), &cli);
         assert_eq!(record.status, output::Status::Resolved);
         // Both overloads should be in `results`.
         assert_eq!(record.results.len(), 2);
@@ -968,9 +1176,10 @@ mod tests {
             legend: false,
             manifest: None,
             budget: None,
+            empty_macro: vec![],
             quiet: false,
         };
-        let record = resolve_one("find-decl", "compute", Query::Declaration, false, false, &result, &eng, &cli);
+        let record = resolve_one("find-decl", "compute", Query::Declaration, false, false, &result, &eng, &std::collections::HashSet::new(), &cli);
         assert_eq!(record.status, output::Status::Resolved);
         // Should show the prototype, not the definition body.
         let file = record.file_path.as_deref().unwrap_or("");
@@ -1026,10 +1235,138 @@ mod tests {
             legend: false,
             manifest: None,
             budget: None,
+            empty_macro: vec![],
             quiet: false,
         };
-        let record = resolve_one("find-decl", "square", Query::Declaration, false, false, &result, &eng, &cli);
+        let record = resolve_one("find-decl", "square", Query::Declaration, false, false, &result, &eng, &std::collections::HashSet::new(), &cli);
         assert_eq!(record.status, output::Status::Resolved);
         assert!(record.content.as_deref().unwrap_or("").contains("square"));
+    }
+
+    // --- multi-window text fallback ---
+
+    fn test_cli(command: Command, root: &std::path::Path) -> Cli {
+        Cli {
+            command,
+            root: vec![root.to_path_buf()],
+            semantic: false,
+            compile_db: None,
+            lang: vec![],
+            max_candidates: 200,
+            max_results: 3,
+            window: 2,
+            jobs: None,
+            no_ignore: false,
+            format: crate::cli::Format::Jsonl,
+            legend: false,
+            manifest: None,
+            budget: None,
+            empty_macro: vec![],
+            quiet: false,
+        }
+    }
+
+    #[test]
+    fn text_fallback_emits_one_window_per_distinct_hit() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        // Three distinct hit lines for `Widget` that the engine won't resolve as
+        // a definition/declaration (bare mentions only).
+        let body = concat!(
+            "// uses Widget here\n",
+            "int a; // Widget\n",
+            "int b;\n",
+            "int c; // Widget again\n",
+        );
+        fs::write(&p, body).unwrap();
+
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("Widget", &finder_cfg).unwrap();
+        assert!(result.candidates.len() >= 3);
+
+        let cli = test_cli(Command::FindDef { name: vec!["Widget".into()], scope: false }, dir.path());
+        let rec = text_fallback("find-def", "Widget", &result, &cli);
+        assert_eq!(rec.status, output::Status::Fallback);
+        // One window per distinct hit line (3), no single-window fields set.
+        assert_eq!(rec.windows.len(), 3);
+        assert!(rec.content_buffer.is_none());
+        assert!(rec.windows.iter().all(|w| !w.content_buffer.is_empty()));
+    }
+
+    #[test]
+    fn text_fallback_single_hit_keeps_single_window_shape() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        fs::write(&p, "int a; // OnlyOnce\n").unwrap();
+
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("OnlyOnce", &finder_cfg).unwrap();
+        let cli = test_cli(Command::FindDef { name: vec!["OnlyOnce".into()], scope: false }, dir.path());
+        let rec = text_fallback("find-def", "OnlyOnce", &result, &cli);
+        assert_eq!(rec.status, output::Status::Fallback);
+        assert!(rec.windows.is_empty());
+        assert!(rec.content_buffer.is_some());
+    }
+
+    #[test]
+    fn collect_unconfirmed_macros_flags_undefined_annotation_tokens() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("api.h");
+        // WINAPI is an UPPER_CASE annotation token with no #define anywhere;
+        // KNOWN is confirmed via the passed set; PI is #defined locally.
+        fs::write(
+            &p,
+            concat!(
+                "#define PI 3.14\n",
+                "static CStr WINAPI Foo(int a);\n",
+                "static CStr KNOWN Bar(int a);\n",
+                "static CStr PI Baz(int a);\n",
+            ),
+        )
+        .unwrap();
+
+        let result = FinderResult {
+            candidates: vec![Candidate {
+                file_path: p.clone(),
+                line: 2,
+                byte_offset: 0,
+                snippet: String::new(),
+            }],
+            truncated: false,
+        };
+        let confirmed: std::collections::HashSet<String> =
+            ["KNOWN".to_string()].into_iter().collect();
+        let mut out = std::collections::BTreeSet::new();
+        collect_unconfirmed_macros(&result, &confirmed, &mut out);
+        // Only WINAPI is unconfirmed: KNOWN is in the set, PI is #defined here.
+        assert_eq!(out.into_iter().collect::<Vec<_>>(), vec!["WINAPI".to_string()]);
+    }
+
+    #[test]
+    fn text_fallback_caps_windows_at_max_results_and_marks_truncated() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.cpp");
+        let body = "// Foo\n// Foo\n// Foo\n// Foo\n// Foo\n";
+        fs::write(&p, body).unwrap();
+
+        let finder_cfg = FinderConfig {
+            roots: vec![dir.path().to_path_buf()],
+            ..Default::default()
+        };
+        let result = search::find_candidates("Foo", &finder_cfg).unwrap();
+        assert!(result.candidates.len() >= 5);
+
+        // max_results = 2 caps the windows; remaining hits set truncated.
+        let mut cli = test_cli(Command::FindDef { name: vec!["Foo".into()], scope: false }, dir.path());
+        cli.max_results = 2;
+        let rec = text_fallback("find-def", "Foo", &result, &cli);
+        assert_eq!(rec.windows.len(), 2);
+        assert!(rec.truncated);
     }
 }
