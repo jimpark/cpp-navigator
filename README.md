@@ -96,13 +96,14 @@ All three commands accept multiple names and a `--manifest` file.
 |------|---------|-------------|
 | `--root <PATH>` | `.` | Search root (repeatable) |
 | `--format <FMT>` | `jsonl` | Output format: `jsonl`, `bundle`, `human` |
-| `--max-results <N>` | `3` | Show full content for up to N overloads before switching to locations-only |
+| `--max-results <N>` | `3` | Show up to N full resolved matches before switching to locations-only |
 | `--max-candidates <N>` | `200` | Cap on candidate files before parsing |
 | `--window <N>` | `10` | ±lines for fallback text windows |
 | `--lang <EXT,...>` | all C/C++ | Restrict to these file extensions |
 | `--no-ignore` | off | Ignore `.gitignore`/`.ignore` rules |
 | `--manifest <PATH>` | — | Read additional query names from a file (one per line, `#` comments) |
 | `--budget <N>` | — | Cap output at ~N tokens (selection-only trim, never edits payload bytes) |
+| `--include <FIELD,...>` | — | Add heavier machine-output fields: `content`, `offsets`, `type` |
 | `--semantic` | off | Enable libclang Stage 2 (`--features semantic` required) |
 | `--compile-db <PATH>` | auto | Path to `compile_commands.json` |
 | `--jobs <N>` | #cores | Parser/walker threads |
@@ -141,6 +142,9 @@ cpp-navigator find-def Widget Draw Resize --root ./src
 # Query from a manifest file, output a bundle for pasting
 cpp-navigator find-def --manifest queries.txt --root ./src --format bundle
 
+# Opt back into raw declaration text + offsets for JSON consumers
+cpp-navigator find-decl Draw --root ./src --include content,offsets,type
+
 # Restrict to header files only
 cpp-navigator find-decl ParseNode --root ./src --lang h,hpp
 
@@ -154,7 +158,7 @@ Every record is one JSON object on its own line. The envelope fields are always 
 
 ```jsonc
 {
-  "schema_version": "1.0",
+  "schema_version": "1.2",
   "tool": "cpp-navigator",
   "command": "find-def",
   "target": "Widget::Draw",
@@ -170,7 +174,7 @@ Branch on `status` and `resolution_type` — never string-scrape content.
 
 | Status | When | Key fields |
 |--------|------|------------|
-| `resolved` | Engine bounded the target to one (or a few) exact constructs | `file_path`, `start_line`, `end_line`, `content`; `results[]` for overloads |
+| `resolved` | Engine bounded the target to one (or a few) exact constructs | `file_path`, `start_line`, `end_line`, structured fields like `signature`/`doc`; `content`, `offsets`, and `type` are opt-in when available |
 | `ambiguous` | Matches exceed `--max-results` | `candidates[]` with file/line/snippet |
 | `fallback` | Text match but no parseable boundary | `file_path`, `approximate_line`, `content_buffer` |
 | `not_found` | No textual match | `message` |
@@ -184,8 +188,6 @@ Branch on `status` and `resolution_type` — never string-scrape content.
   "file_path": "src/widget.cpp",
   "start_line": 10,
   "end_line": 15,
-  "start_byte": 120,
-  "end_byte": 198,
   "content": "void Widget::Draw() {\n    // Draw implementation\n}"
 }
 ```
@@ -196,11 +198,16 @@ Branch on `status` and `resolution_type` — never string-scrape content.
 {
   "status": "resolved",
   "resolution_type": "declaration",
+  "qualified_name": "ui::Widget::Draw",
   "signature": "void Draw()",
-  "type": "void()",
   "doc": "/// Draw the widget on screen."
 }
 ```
+
+By default, machine-readable declaration output prefers structured fields over raw
+source when it has a rich summary (`signature` plus `doc` or `qualified_name`).
+Opt back into heavier fields with `--include content`, `--include offsets`, and
+`--include type`.
 
 ### Multiple overloads (`results` array)
 
@@ -294,7 +301,7 @@ When 2–N overloads are found and N ≤ `--max-results`, a single record carrie
 |------------|----------|
 | `jsonl` | Default. One JSON record per line; pipe or redirect to a file. |
 | `bundle` | All records in a single ` ```json ` fence with a `~N tokens` footer. Paste this block directly into a chat. |
-| `human` | ANSI-colored text for reading in a terminal. Enabled automatically when stdout is a TTY. |
+| `human` | Readable terminal output with labeled sections and ANSI color when stdout is a TTY. |
 
 ## Degradation ladder
 

@@ -216,7 +216,7 @@ Resolution  { symbol, source_ref, content_bytes, engine, confidence, status }
 ### 8.2 Common envelope (every record)
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.2",
   "tool": "cpp-navigator",
   "command": "find-def",
   "target": "InitializeMemoryPool",
@@ -229,7 +229,7 @@ Resolution  { symbol, source_ref, content_bytes, engine, confidence, status }
 ### 8.3 Resolved definition / declaration
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.2",
   "command": "find-def",
   "target": "InitializeMemoryPool",
   "status": "resolved",
@@ -238,27 +238,33 @@ Resolution  { symbol, source_ref, content_bytes, engine, confidence, status }
   "file_path": "src/core/memory.cpp",
   "start_line": 142,
   "end_line": 165,
-  "start_byte": 4821,
-  "end_byte": 5403,
   "content": "void InitializeMemoryPool(size_t pool_size) {\n    std::lock_guard<std::mutex> lock(pool_mutex);\n}"
 }
 ```
-`find-decl` adds `signature`, `type`, and `doc` and typically omits a body:
+`find-decl` adds structured declaration fields and omits heavier raw-source fields
+by default:
 ```json
 {
   "resolution_type": "declaration",
+  "qualified_name": "core::InitializeMemoryPool",
   "signature": "void InitializeMemoryPool(size_t pool_size);",
-  "type": "void(size_t)",
   "doc": "/// Allocate the global pool. Must be called once at startup."
 }
 ```
+Use `--include content`, `--include offsets`, and `--include type` to restore the
+verbatim source slice, byte offsets, and normalized type spelling in JSON/bundle
+output.
 
 ### 8.4 Byte-fidelity contract
 - `content` is the exact byte range `[start_byte, end_byte)` of the file, JSON-string
   escaped *only* as JSON requires (`\n`, `\t`, `\"`, `\\`, control chars). No CRLF→LF
   normalization, no dedent, no trim.
-- `start_byte`/`end_byte` are always emitted so an agent can re-slice from disk and
-  verify a perfect round-trip independent of the escaped string.
+- `start_byte`/`end_byte` are emitted when byte-fidelity is requested via
+  `--include offsets`, so an agent can re-slice from disk and verify a perfect
+  round-trip independent of the escaped string.
+- When a rich structured declaration summary is available (`signature` plus `doc`
+  or `qualified_name`), `jsonl`/`bundle` omit `content` by default to reduce
+  duplicate tokens. `human` may still render the source text directly.
 
 ### 8.5 Ambiguous (overloads / multiple definitions)
 ```json
@@ -299,14 +305,23 @@ Resolution  { symbol, source_ref, content_bytes, engine, confidence, status }
 ```
 
 ### 8.8 Output profiles (`--format`)
-Identical record *data* in both profiles; the profile is a presentation wrapper, never
-a payload change (§8.4 still holds).
+`jsonl` and `bundle` carry the same JSON records; `human` is a terminal-oriented
+rendering of those records with readability-focused labels.
 - **`jsonl` (default):** one record per line. For programmatic consumption or a local
   wrapper that injects results.
 - **`bundle`:** a single fenced block suitable for a human to paste into a chat. With
   `--legend`, the block is prefixed with a short, one-time key explaining the record
   fields so the model interprets them without the human authoring instructions. Bundle
   output ends with a footer line carrying an estimated token count for the block.
+- **`human`:** readable terminal output with labeled sections (location, signature,
+   documentation, source) and ANSI color when stdout is a TTY.
+
+### 8.8.1 Optional heavy fields (`--include`)
+- `--include content` — include the raw declaration source in machine-readable output
+  even when structured declaration fields are present.
+- `--include offsets` — include `start_byte` / `end_byte` for exact re-slicing.
+- `--include type` — include normalized type spelling (e.g. `void(size_t)`).
+- Fields may be passed comma-separated or by repeating `--include`.
 
 ### 8.9 Batch / manifest queries
 To minimize human round trips, multiple queries can run in one invocation:
@@ -393,8 +408,9 @@ Global options:
   --window <n>             Fallback context window in lines (default 10).
   --jobs <n>               Parser threads (default: #cores).
   --no-ignore              Do not honor .gitignore/.ignore.
-  --format <jsonl|bundle>  Output profile (default jsonl; §8.8).
+  --format <jsonl|bundle|human>  Output profile (default jsonl; §8.8).
   --legend                 In bundle mode, prepend a one-time field legend.
+  --include <content|offsets|type>  Add heavier fields to machine-readable output.
   --manifest <path>        Run multiple queries from a file, one per line (§8.9).
   --budget <n>             Cap estimated output tokens; selection-only trim (§8.10).
   --quiet                  Suppress stderr diagnostics.

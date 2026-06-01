@@ -9,10 +9,10 @@ use std::io::{self, Write};
 
 use serde::Serialize;
 
-use crate::cli::Format;
+use crate::cli::{Format, IncludeField};
 use crate::model::Resolution;
 
-pub const SCHEMA_VERSION: &str = "1.0";
+pub const SCHEMA_VERSION: &str = "1.2";
 pub const TOOL: &str = "cpp-navigator";
 
 /// Wire-level status (snake_case on the wire to match `resolution_type`).
@@ -47,9 +47,12 @@ pub struct ResolvedResult {
     pub file_path: String,
     pub start_line: usize,
     pub end_line: usize,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -111,6 +114,8 @@ pub struct Record {
     pub end_byte: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
 
     // find-decl extras ----------------------------------------------------
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,6 +181,7 @@ impl Record {
             start_byte: None,
             end_byte: None,
             content: None,
+            qualified_name: None,
             signature: None,
             type_spelling: None,
             doc: None,
@@ -202,8 +208,10 @@ impl Record {
     }
 
     /// The `resolved` rung: an engine bounded the target to one exact construct
-    /// (design-specs §8.3). `content` is the verbatim byte slice. For `find-decl`
-    /// the signature/type/doc fields are populated from the symbol.
+    /// (design-specs §8.3). `content` is the verbatim byte slice before any
+    /// output projection. For `find-decl` the signature/type/doc fields are
+    /// populated from the symbol, allowing machine-readable output to omit the
+    /// raw source unless the caller explicitly requests it.
     pub fn resolved(command: &str, target: &str, resolution_type: &str, r: &Resolution) -> Self {
         let mut rec = Record::new(command, target, Status::Resolved, resolution_type);
         let span = &r.source_ref.span;
@@ -214,6 +222,7 @@ impl Record {
         rec.start_byte = Some(span.start_byte);
         rec.end_byte = Some(span.end_byte);
         rec.content = Some(String::from_utf8_lossy(&r.content_bytes).into_owned());
+        rec.qualified_name = r.symbol.qualified_name.clone();
         rec.signature = r.symbol.signature.clone();
         rec.type_spelling = r.symbol.type_spelling.clone();
         rec.doc = r.symbol.doc.clone();
@@ -266,7 +275,7 @@ impl Record {
         r
     }
 
-    /// Multiple resolved results (overloads shown with full content).
+    /// Multiple resolved results (overloads shown as full records).
     pub fn multi_resolved(
         command: &str,
         target: &str,
@@ -282,9 +291,9 @@ impl Record {
                 file_path: r.source_ref.file_path.to_string_lossy().into_owned(),
                 start_line: r.source_ref.span.start_line,
                 end_line: r.source_ref.span.end_line,
-                start_byte: r.source_ref.span.start_byte,
-                end_byte: r.source_ref.span.end_byte,
-                content: String::from_utf8_lossy(&r.content_bytes).into_owned(),
+                start_byte: Some(r.source_ref.span.start_byte),
+                end_byte: Some(r.source_ref.span.end_byte),
+                content: Some(String::from_utf8_lossy(&r.content_bytes).into_owned()),
                 signature: r.symbol.signature.clone(),
                 type_spelling: r.symbol.type_spelling.clone(),
                 doc: r.symbol.doc.clone(),
@@ -342,6 +351,75 @@ pub struct TextWindow {
     pub before: usize,
     pub after: usize,
     pub content_buffer: String,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DetailSelection {
+    include_content: bool,
+    include_offsets: bool,
+    include_type: bool,
+}
+
+impl DetailSelection {
+    fn for_format(format: Format, include: &[IncludeField]) -> Self {
+        let mut selection = match format {
+            Format::Human => Self {
+                include_content: true,
+                include_offsets: false,
+                include_type: true,
+            },
+            Format::Jsonl | Format::Bundle => Self::default(),
+        };
+        for field in include {
+            match field {
+                IncludeField::Content => selection.include_content = true,
+                IncludeField::Offsets => selection.include_offsets = true,
+                IncludeField::Type => selection.include_type = true,
+            }
+        }
+        selection
+    }
+}
+
+impl Record {
+    fn has_rich_structured_summary(&self) -> bool {
+        self.signature.is_some() && (self.doc.is_some() || self.qualified_name.is_some())
+    }
+
+    fn project_for_output(&mut self, selection: DetailSelection) {
+        if !selection.include_offsets {
+            self.start_byte = None;
+            self.end_byte = None;
+        }
+        if !selection.include_type {
+            self.type_spelling = None;
+        }
+        if !selection.include_content && self.has_rich_structured_summary() {
+            self.content = None;
+        }
+        for result in &mut self.results {
+            if !selection.include_offsets {
+                result.start_byte = None;
+                result.end_byte = None;
+            }
+            if !selection.include_type {
+                result.type_spelling = None;
+            }
+            let has_rich_structured_summary =
+                result.signature.is_some() && (result.doc.is_some() || result.qualified_name.is_some());
+            if !selection.include_content && has_rich_structured_summary {
+                result.content = None;
+            }
+        }
+    }
+}
+
+pub fn project_records(mut records: Vec<Record>, format: Format, include: &[IncludeField]) -> Vec<Record> {
+    let selection = DetailSelection::for_format(format, include);
+    for record in &mut records {
+        record.project_for_output(selection);
+    }
+    records
 }
 
 /// Streams records to a sink in the selected [`Format`].
@@ -420,6 +498,32 @@ impl<W: Write> Writer<W> {
 ///
 /// When `colors` is true, ANSI escape codes are emitted for bold/color
 /// highlights. When false, the output is plain text suitable for piping.
+fn strip_leading_line_breaks(mut text: &str) -> &str {
+    while let Some(rest) = text.strip_prefix("\r\n") {
+        text = rest;
+    }
+    while let Some(rest) = text.strip_prefix(['\n', '\r']) {
+        text = rest;
+    }
+    text
+}
+
+fn content_without_doc<'a>(content: &'a str, doc: Option<&str>) -> &'a str {
+    let Some(doc) = doc else { return content };
+    let Some(rest) = content.strip_prefix(doc) else {
+        return content;
+    };
+    strip_leading_line_breaks(rest)
+}
+
+fn push_indented_lines(out: &mut String, text: &str, indent: &str) {
+    for line in text.lines() {
+        out.push_str(indent);
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
 fn render_human(record: &Record, colors: bool) -> String {
     let bold   = |s: &str| if colors { format!("\x1b[1m{s}\x1b[0m")    } else { s.to_string() };
     let green  = |s: &str| if colors { format!("\x1b[32;1m{s}\x1b[0m") } else { s.to_string() };
@@ -455,12 +559,25 @@ fn render_human(record: &Record, colors: bool) -> String {
                 for (i, r) in record.results.iter().enumerate() {
                     let loc = format!("{}:{}-{}", r.file_path, r.start_line, r.end_line);
                     out += &format!("\n[{}] {}\n", i + 1, cyan(&loc));
-                    if let Some(sig) = &r.signature {
-                        out += &format!("    {}\n", dim(sig));
+                    if let Some(name) = &r.qualified_name {
+                        out += &format!("    {}: {}\n", bold("Qualified"), name);
                     }
-                    out += "\n";
-                    for line in r.content.lines() {
-                        out += &format!("    {line}\n");
+                    if let Some(sig) = &r.signature {
+                        out += &format!("    {}: {}\n", bold("Signature"), sig);
+                    }
+                    if let Some(ty) = &r.type_spelling {
+                        out += &format!("    {}: {}\n", bold("Type"), ty);
+                    }
+                    if let Some(doc) = &r.doc {
+                        out += &format!("    {}:\n", bold("Documentation"));
+                        push_indented_lines(&mut out, doc, "        ");
+                    }
+                    if let Some(content) = &r.content {
+                        let source = content_without_doc(content, r.doc.as_deref());
+                        if !source.is_empty() {
+                            out += &format!("    {}:\n", bold("Source"));
+                            push_indented_lines(&mut out, source, "        ");
+                        }
                     }
                 }
             } else if !record.contexts.is_empty() {
@@ -498,18 +615,25 @@ fn render_human(record: &Record, colors: bool) -> String {
                     record.start_line.unwrap_or(0),
                     record.end_line.unwrap_or(0),
                 );
-                out += &format!("{}\n", cyan(&loc));
-                if let Some(sig) = &record.signature {
-                    out += &format!("Signature: {sig}\n");
+                out += &format!("{}: {}\n", bold("Location"), cyan(&loc));
+                if let Some(name) = &record.qualified_name {
+                    out += &format!("{}: {name}\n", bold("Qualified"));
                 }
-                // `doc` is omitted here: the comment is already included at the
-                // top of `content` (the engine extends spans to cover it), so
-                // rendering it twice would be redundant. The `doc` field remains
-                // in the JSONL wire format for structured access.
-                out += "\n";
+                if let Some(sig) = &record.signature {
+                    out += &format!("{}: {sig}\n", bold("Signature"));
+                }
+                if let Some(ty) = &record.type_spelling {
+                    out += &format!("{}: {ty}\n", bold("Type"));
+                }
+                if let Some(doc) = &record.doc {
+                    out += &format!("\n{}:\n", bold("Documentation"));
+                    push_indented_lines(&mut out, doc, "    ");
+                }
                 if let Some(content) = &record.content {
-                    for line in content.lines() {
-                        out += &format!("    {line}\n");
+                    let source = content_without_doc(content, record.doc.as_deref());
+                    if !source.is_empty() {
+                        out += &format!("\n{}:\n", bold("Source"));
+                        push_indented_lines(&mut out, source, "    ");
                     }
                 }
                 if record.truncated {
@@ -753,7 +877,7 @@ mod tests {
     /// JSON Schema structural validation: every Record emitted via serde_json
     /// must contain the required envelope fields and a valid schema_version.
     #[test]
-    fn schema_version_1_0_envelope_fields() {
+    fn schema_version_1_2_envelope_fields() {
         // Test all status variants to ensure schema_version + envelope always present.
         let records = vec![
             Record::not_found("find-def", "missing"),
@@ -797,7 +921,7 @@ mod tests {
             let obj = val.as_object().unwrap();
 
             // Required envelope fields (design-specs §8).
-            assert_eq!(obj["schema_version"].as_str().unwrap(), "1.0");
+            assert_eq!(obj["schema_version"].as_str().unwrap(), "1.2");
             assert_eq!(obj["tool"].as_str().unwrap(), "cpp-navigator");
             assert!(obj.contains_key("command"), "missing 'command'");
             assert!(obj.contains_key("target"), "missing 'target'");
@@ -833,5 +957,153 @@ mod tests {
         assert!(!obj.contains_key("results"));
         assert!(!obj.contains_key("truncated"));
         assert!(!obj.contains_key("budget_trimmed"));
+    }
+
+    #[test]
+    fn json_projection_prefers_structured_decl_fields() {
+        let mut rec = Record::new("find-decl", "foo", Status::Resolved, "declaration");
+        rec.file_path = Some("/tmp/a.hpp".to_string());
+        rec.start_line = Some(1);
+        rec.end_line = Some(2);
+        rec.start_byte = Some(0);
+        rec.end_byte = Some(27);
+        rec.doc = Some("/// Explain foo.".to_string());
+        rec.qualified_name = Some("ns::foo".to_string());
+        rec.signature = Some("void foo();".to_string());
+        rec.type_spelling = Some("void()".to_string());
+        rec.content = Some("/// Explain foo.\nvoid foo();".to_string());
+        rec.results.push(ResolvedResult {
+            file_path: "/tmp/a.hpp".to_string(),
+            start_line: 1,
+            end_line: 2,
+            start_byte: Some(0),
+            end_byte: Some(27),
+            content: Some("/// Explain foo.\nvoid foo();".to_string()),
+            signature: Some("void foo();".to_string()),
+            type_spelling: Some("void()".to_string()),
+            doc: Some("/// Explain foo.".to_string()),
+            qualified_name: Some("ns::foo".to_string()),
+        });
+
+        let projected = project_records(vec![rec], Format::Jsonl, &[]);
+        let json_str = serde_json::to_string(&projected[0]).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj["schema_version"], "1.2");
+        assert_eq!(obj["doc"], "/// Explain foo.");
+        assert_eq!(obj["qualified_name"], "ns::foo");
+        assert_eq!(obj["signature"], "void foo();");
+        assert!(!obj.contains_key("content"));
+        assert!(!obj.contains_key("start_byte"));
+        assert!(!obj.contains_key("end_byte"));
+        assert!(!obj.contains_key("type"));
+
+        let results = obj["results"].as_array().unwrap();
+        let result = results[0].as_object().unwrap();
+        assert_eq!(result["doc"], "/// Explain foo.");
+        assert_eq!(result["qualified_name"], "ns::foo");
+        assert_eq!(result["signature"], "void foo();");
+        assert!(!result.contains_key("content"));
+        assert!(!result.contains_key("start_byte"));
+        assert!(!result.contains_key("end_byte"));
+        assert!(!result.contains_key("type"));
+    }
+
+    #[test]
+    fn json_projection_restores_optional_fields_when_requested() {
+        let mut rec = Record::new("find-decl", "foo", Status::Resolved, "declaration");
+        rec.start_byte = Some(0);
+        rec.end_byte = Some(27);
+        rec.signature = Some("void foo();".to_string());
+        rec.type_spelling = Some("void()".to_string());
+        rec.content = Some("/// Explain foo.\nvoid foo();".to_string());
+        rec.results.push(ResolvedResult {
+            file_path: "/tmp/a.hpp".to_string(),
+            start_line: 1,
+            end_line: 2,
+            start_byte: Some(0),
+            end_byte: Some(27),
+            content: Some("/// Explain foo.\nvoid foo();".to_string()),
+            signature: Some("void foo();".to_string()),
+            type_spelling: Some("void()".to_string()),
+            doc: None,
+            qualified_name: None,
+        });
+
+        let projected = project_records(
+            vec![rec],
+            Format::Jsonl,
+            &[IncludeField::Content, IncludeField::Offsets, IncludeField::Type],
+        );
+        let json_str = serde_json::to_string(&projected[0]).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj["content"], "/// Explain foo.\nvoid foo();");
+        assert_eq!(obj["start_byte"], 0);
+        assert_eq!(obj["end_byte"], 27);
+        assert_eq!(obj["signature"], "void foo();");
+        assert_eq!(obj["type"], "void()");
+
+        let results = obj["results"].as_array().unwrap();
+        let result = results[0].as_object().unwrap();
+        assert_eq!(result["content"], "/// Explain foo.\nvoid foo();");
+        assert_eq!(result["start_byte"], 0);
+        assert_eq!(result["end_byte"], 27);
+        assert_eq!(result["type"], "void()");
+    }
+
+    #[test]
+    fn json_projection_keeps_content_for_thin_structured_decl() {
+        let mut rec = Record::new("find-decl", "foo", Status::Resolved, "declaration");
+        rec.start_byte = Some(0);
+        rec.end_byte = Some(14);
+        rec.signature = Some("void foo();".to_string());
+        rec.content = Some("void foo();".to_string());
+        rec.results.push(ResolvedResult {
+            file_path: "/tmp/a.hpp".to_string(),
+            start_line: 1,
+            end_line: 1,
+            start_byte: Some(0),
+            end_byte: Some(14),
+            content: Some("void foo();".to_string()),
+            signature: Some("void foo();".to_string()),
+            type_spelling: None,
+            doc: None,
+            qualified_name: None,
+        });
+
+        let projected = project_records(vec![rec], Format::Jsonl, &[]);
+        let json_str = serde_json::to_string(&projected[0]).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj["content"], "void foo();");
+        assert!(!obj.contains_key("start_byte"));
+        assert!(!obj.contains_key("end_byte"));
+
+        let results = obj["results"].as_array().unwrap();
+        let result = results[0].as_object().unwrap();
+        assert_eq!(result["content"], "void foo();");
+        assert!(!result.contains_key("start_byte"));
+        assert!(!result.contains_key("end_byte"));
+    }
+
+    #[test]
+    fn human_output_shows_doc_once_with_labeled_sections() {
+        let mut rec = Record::new("find-decl", "foo", Status::Resolved, "declaration");
+        rec.file_path = Some("/tmp/a.hpp".to_string());
+        rec.start_line = Some(7);
+        rec.end_line = Some(8);
+        rec.signature = Some("void foo();".to_string());
+        rec.type_spelling = Some("void()".to_string());
+        rec.doc = Some("/// Explain foo.".to_string());
+        rec.content = Some("/// Explain foo.\nvoid foo();".to_string());
+
+        let rendered = render_human(&rec, false);
+        assert!(rendered.contains("Location: /tmp/a.hpp:7-8"));
+        assert!(rendered.contains("Signature: void foo();"));
+        assert!(rendered.contains("Type: void()"));
+        assert!(rendered.contains("Documentation:\n    /// Explain foo.\n"));
+        assert!(rendered.contains("Source:\n    void foo();\n"));
+        assert_eq!(rendered.matches("/// Explain foo.").count(), 1);
     }
 }

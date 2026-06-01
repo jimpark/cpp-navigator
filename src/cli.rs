@@ -12,8 +12,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::commands;
 
-/// Output presentation profile (design-specs §8.8). Record *data* is identical
-/// across profiles; this only selects the wrapper.
+/// Output presentation profile (design-specs §8.8). `jsonl` and `bundle` share
+/// the same JSON record data; `human` renders a terminal-oriented view of those
+/// records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Format {
     /// One JSON object per line (default).
@@ -22,6 +23,17 @@ pub enum Format {
     Bundle,
     /// Human-readable text for terminal use; uses ANSI color when stdout is a TTY.
     Human,
+}
+
+/// Optional heavy fields for machine-readable output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum IncludeField {
+    /// Include the raw declaration/definition source text when structured fields exist.
+    Content,
+    /// Include byte offsets for exact re-slicing.
+    Offsets,
+    /// Include the normalized type spelling.
+    Type,
 }
 
 #[derive(Parser, Debug)]
@@ -56,8 +68,8 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N", default_value_t = 200)]
     pub max_candidates: usize,
 
-    /// When multiple definitions/declarations match (overloads), show full
-    /// content for up to this many results instead of just ambiguous locations.
+    /// When multiple definitions/declarations match (overloads), show up to
+    /// this many full resolved results instead of just ambiguous locations.
     #[arg(long, global = true, value_name = "N", default_value_t = 3)]
     pub max_results: usize,
 
@@ -80,6 +92,10 @@ pub struct Cli {
     /// In bundle mode, prepend a one-time field legend.
     #[arg(long, global = true)]
     pub legend: bool,
+
+    /// Include additional heavy fields in machine-readable output. Repeatable or comma-separated.
+    #[arg(long, global = true, value_enum, value_name = "FIELD", value_delimiter = ',')]
+    pub include: Vec<IncludeField>,
 
     /// Run multiple queries from a file, one per line.
     #[arg(long, global = true, value_name = "PATH")]

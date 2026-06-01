@@ -58,7 +58,7 @@ fn golden_find_def_resolved_single() {
     assert_eq!(records.len(), 1);
 
     let r = &records[0];
-    assert_eq!(r["schema_version"], "1.0");
+    assert_eq!(r["schema_version"], "1.2");
     assert_eq!(r["tool"], "cpp-navigator");
     assert_eq!(r["command"], "find-def");
     assert_eq!(r["target"], "InitializeUI");
@@ -105,7 +105,7 @@ fn golden_find_decl_resolved_in_header() {
     let root = fixture_root();
     let out = run_nav(&[
         "find-decl",
-        "Widget",
+        "Draw",
         "--root",
         root.to_str().unwrap(),
     ]);
@@ -119,6 +119,35 @@ fn golden_find_decl_resolved_in_header() {
         file_path.contains("widget.h") || r["status"] == "resolved",
         "expected header resolution"
     );
+    assert_eq!(r["schema_version"], "1.2");
+    assert!(r["doc"].as_str().unwrap_or("").contains("Draw the widget on screen"));
+    assert!(r["signature"].as_str().is_some());
+    assert!(r.get("content").is_none(), "content should be opt-in for declarations");
+    assert!(r.get("start_byte").is_none(), "offsets should be opt-in");
+    assert!(r.get("end_byte").is_none(), "offsets should be opt-in");
+    assert!(r.get("type").is_none(), "type should be opt-in");
+}
+
+#[test]
+fn golden_find_decl_with_includes_restores_optional_fields() {
+    let root = fixture_root();
+    let out = run_nav(&[
+        "find-decl",
+        "Draw",
+        "--root",
+        root.to_str().unwrap(),
+        "--include",
+        "content,offsets,type",
+    ]);
+    let records = parse_jsonl(&out);
+    assert_eq!(records.len(), 1);
+
+    let r = &records[0];
+    assert_eq!(r["schema_version"], "1.2");
+    assert!(r["content"].as_str().unwrap_or("").contains("void Draw()"));
+    assert!(r["start_byte"].as_u64().is_some());
+    assert!(r["end_byte"].as_u64().is_some());
+    assert!(r["type"].as_str().is_some());
 }
 
 #[test]
@@ -223,7 +252,7 @@ fn zero_egress_no_network() {
         assert!(!stdout.is_empty(), "should produce output without network");
         let records = parse_jsonl(&stdout);
         assert!(!records.is_empty());
-        assert_eq!(records[0]["schema_version"], "1.0");
+        assert_eq!(records[0]["schema_version"], "1.2");
     } else {
         // Fallback: just run normally and ensure it produces valid output (no
         // compile-time network dependencies).
@@ -265,7 +294,7 @@ fn schema_validation_all_commands() {
             let obj = rec.as_object().unwrap();
 
             // Envelope fields must always be present.
-            assert_eq!(obj["schema_version"], "1.0", "args: {args:?}");
+            assert_eq!(obj["schema_version"], "1.2", "args: {args:?}");
             assert_eq!(obj["tool"], "cpp-navigator", "args: {args:?}");
             assert!(obj.contains_key("command"), "missing 'command' for {args:?}");
             assert!(obj.contains_key("target"), "missing 'target' for {args:?}");

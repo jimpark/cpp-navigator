@@ -122,6 +122,8 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
         records.push(record);
     }
 
+    records = output::project_records(records, cli.format, &cli.include);
+
     // Apply --budget trimming if requested (design-specs §8.10).
     if let Some(budget) = cli.budget {
         records = output::apply_budget(records, budget);
@@ -255,7 +257,7 @@ fn resolve_one(
             rec
         }
         n if n <= cli.max_results => {
-            // Show all matches with full content (user-preferred behavior for overloads).
+            // Show all matches as full records rather than ambiguous locations.
             let rtype = resolution_type(query, resolutions[0].symbol.kind);
             let mut rec = Record::multi_resolved(command, target, &rtype, &resolutions, n);
             if decl_used_defs {
@@ -764,6 +766,7 @@ mod tests {
             no_ignore: false,
             format: crate::cli::Format::Jsonl,
             legend: false,
+            include: vec![],
             manifest: None,
             budget: None,
             empty_macro: vec![],
@@ -810,6 +813,7 @@ mod tests {
             no_ignore: false,
             format: crate::cli::Format::Jsonl,
             legend: false,
+            include: vec![],
             manifest: None,
             budget: None,
             empty_macro: vec![],
@@ -864,8 +868,8 @@ mod tests {
         );
         assert_eq!(record.status, output::Status::Resolved);
         assert_eq!(record.results.len(), 2);
-        assert!(record.results[0].content.contains("x++"));
-        assert!(record.results[1].content.contains("y *= 2"));
+        assert!(record.results[0].content.as_deref().unwrap_or("").contains("x++"));
+        assert!(record.results[1].content.as_deref().unwrap_or("").contains("y *= 2"));
     }
 
     #[test]
@@ -968,6 +972,7 @@ mod tests {
             no_ignore: false,
             format: crate::cli::Format::Jsonl,
             legend: false,
+            include: vec![],
             manifest: None,
             budget: None,
             empty_macro: vec![],
@@ -1088,6 +1093,7 @@ mod tests {
             no_ignore: false,
             format: crate::cli::Format::Jsonl,
             legend: false,
+            include: vec![],
             manifest: None,
             budget: None,
             empty_macro: vec![],
@@ -1130,6 +1136,7 @@ mod tests {
             no_ignore: false,
             format: crate::cli::Format::Jsonl,
             legend: false,
+            include: vec![],
             manifest: None,
             budget: None,
             empty_macro: vec![],
@@ -1174,6 +1181,7 @@ mod tests {
             no_ignore: false,
             format: crate::cli::Format::Jsonl,
             legend: false,
+            include: vec![],
             manifest: None,
             budget: None,
             empty_macro: vec![],
@@ -1233,6 +1241,7 @@ mod tests {
             no_ignore: false,
             format: crate::cli::Format::Jsonl,
             legend: false,
+            include: vec![],
             manifest: None,
             budget: None,
             empty_macro: vec![],
@@ -1259,6 +1268,7 @@ mod tests {
             no_ignore: false,
             format: crate::cli::Format::Jsonl,
             legend: false,
+            include: vec![],
             manifest: None,
             budget: None,
             empty_macro: vec![],
