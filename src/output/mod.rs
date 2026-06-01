@@ -502,11 +502,10 @@ fn render_human(record: &Record, colors: bool) -> String {
                 if let Some(sig) = &record.signature {
                     out += &format!("Signature: {sig}\n");
                 }
-                if let Some(doc) = &record.doc {
-                    for line in doc.lines() {
-                        out += &format!("{}\n", dim(line));
-                    }
-                }
+                // `doc` is omitted here: the comment is already included at the
+                // top of `content` (the engine extends spans to cover it), so
+                // rendering it twice would be redundant. The `doc` field remains
+                // in the JSONL wire format for structured access.
                 out += "\n";
                 if let Some(content) = &record.content {
                     for line in content.lines() {

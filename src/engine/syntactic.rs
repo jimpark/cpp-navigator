@@ -316,17 +316,32 @@ fn try_match(
 
     // Expand template-wrapped constructs to the full template_declaration span.
     let report = report_node(node);
-    let span = span_of(report);
+    let decl_span = span_of(report);
+
+    // Extend the reported span backward to include any leading doc comment so
+    // that `content` carries the full context (comment + declaration), matching
+    // the behaviour of the text-fallback path. The `doc` field is also populated
+    // for structured access. Applied to both definitions and declarations.
+    let doc_info = leading_doc(report, src);
+    let span = match &doc_info {
+        Some(d) => Span {
+            start_byte: d.start_byte,
+            start_line: d.start_line,
+            start_col: d.start_col,
+            ..decl_span
+        },
+        None => decl_span,
+    };
     let content_bytes = src[span.start_byte..span.end_byte].to_vec();
 
     let (signature, type_spelling, doc) = if mode == Mode::Declaration {
         (
             Some(text(node, src).trim().to_string()),
             type_spelling(node, src),
-            leading_doc(report, src),
+            doc_info.map(|d| d.text),
         )
     } else {
-        (None, None, None)
+        (None, None, doc_info.map(|d| d.text))
     };
 
     let resolution_kind = if report.kind() == "template_declaration" {
@@ -691,6 +706,19 @@ fn find_function_declarator(node: Node) -> Option<Node> {
     }
 }
 
+/// The leading doc comment block immediately above a node, together with the
+/// byte position where that block starts. Used to extend content spans so the
+/// comment is visible in the `content` payload, not only in the `doc` field.
+struct LeadingDoc {
+    text: String,
+    /// Byte offset of the first character of the topmost comment line.
+    start_byte: usize,
+    /// 1-based line of `start_byte`.
+    start_line: usize,
+    /// 0-based byte column of `start_byte` within its line.
+    start_col: usize,
+}
+
 /// Collect the contiguous comment block immediately above `node` (design-specs
 /// §7.2: line `//` runs or `/* ... */` blocks). Returns `None` if absent.
 ///
@@ -701,33 +729,38 @@ fn find_function_declarator(node: Node) -> Option<Node> {
 /// function. The engine matches on the `declaration` node; to find the doc
 /// comment we must step over the same-row `field_declaration` fragment that
 /// sits between the comment and our node.
-fn leading_doc(node: Node, src: &[u8]) -> Option<String> {
+fn leading_doc(node: Node, src: &[u8]) -> Option<LeadingDoc> {
     let node_start_row = node.start_position().row;
 
     // Strategy 1: prev_sibling() chain, stepping over any same-row
     // field_declaration that is the macro-prefix fragment of our declaration.
     {
-        let mut comments = Vec::new();
+        let mut comments: Vec<Node> = Vec::new();
         let mut anchor_row = node_start_row;
         let mut prev = node.prev_sibling();
         while let Some(p) = prev {
             match p.kind() {
                 "comment" => {
                     if p.end_position().row + 1 < anchor_row { break; }
-                    comments.push(text(p, src));
+                    comments.push(p);
                     anchor_row = p.start_position().row;
                     prev = p.prev_sibling();
                 }
                 "field_declaration" if p.start_position().row == node_start_row => {
-                    // Same-line fragment (type/macro prefix) — step over it.
                     prev = p.prev_sibling();
                 }
                 _ => break,
             }
         }
         if !comments.is_empty() {
-            comments.reverse();
-            return Some(comments.join("\n"));
+            comments.reverse(); // now oldest-first
+            let top = comments[0];
+            return Some(LeadingDoc {
+                text: comments.iter().map(|n| text(*n, src)).collect::<Vec<_>>().join("\n"),
+                start_byte: top.start_byte(),
+                start_line: top.start_position().row + 1,
+                start_col: top.start_position().column,
+            });
         }
     }
 
@@ -738,7 +771,7 @@ fn leading_doc(node: Node, src: &[u8]) -> Option<String> {
         let mut cursor = parent.walk();
         let siblings: Vec<_> = parent.children(&mut cursor).collect();
         if let Some(idx) = siblings.iter().position(|s| s.id() == node.id()) {
-            let mut comments = Vec::new();
+            let mut comments: Vec<Node> = Vec::new();
             let mut anchor_row = node_start_row;
             let mut i = idx;
             while i > 0 {
@@ -747,18 +780,22 @@ fn leading_doc(node: Node, src: &[u8]) -> Option<String> {
                 match s.kind() {
                     "comment" => {
                         if s.end_position().row + 1 < anchor_row { break; }
-                        comments.push(text(s, src));
+                        comments.push(s);
                         anchor_row = s.start_position().row;
                     }
-                    "field_declaration" if s.start_position().row == node_start_row => {
-                        // Step over same-line type/macro prefix fragment.
-                    }
+                    "field_declaration" if s.start_position().row == node_start_row => {}
                     _ => break,
                 }
             }
             if !comments.is_empty() {
                 comments.reverse();
-                return Some(comments.join("\n"));
+                let top = comments[0];
+                return Some(LeadingDoc {
+                    text: comments.iter().map(|n| text(*n, src)).collect::<Vec<_>>().join("\n"),
+                    start_byte: top.start_byte(),
+                    start_line: top.start_position().row + 1,
+                    start_col: top.start_position().column,
+                });
             }
         }
     }
@@ -872,6 +909,78 @@ mod tests {
         assert_eq!(s.signature.as_deref(), Some("void InitPool(size_t n);"));
         assert_eq!(s.doc.as_deref(), Some("/// Allocate the global pool."));
         assert_eq!(s.type_spelling.as_deref(), Some("void(size_t)"));
+    }
+
+    #[test]
+    fn declaration_content_includes_leading_comment() {
+        // The `content` payload must start at the doc comment, not the
+        // declaration keyword, so LLMs get the full context in one field.
+        let dir = TempDir::new().unwrap();
+        let body = "/// Allocate the global pool.\nvoid InitPool(size_t n);\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("InitPool", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        let content = String::from_utf8_lossy(&res[0].content_bytes);
+        assert!(content.starts_with("/// Allocate"), "content should start with the doc comment");
+        assert!(content.contains("void InitPool"), "content should include the declaration");
+        // Byte-fidelity: re-slice from disk equals reported content.
+        let disk = fs::read(&p).unwrap();
+        let span = &res[0].source_ref.span;
+        assert_eq!(&disk[span.start_byte..span.end_byte], res[0].content_bytes.as_slice());
+        assert_eq!(span.start_line, 1, "span should start at the comment line");
+    }
+
+    #[test]
+    fn definition_content_includes_leading_comment() {
+        // Definitions also extend their span to cover the leading comment.
+        let dir = TempDir::new().unwrap();
+        let body = "/// Compute the sum.\nint add(int a, int b) {\n    return a + b;\n}\n";
+        let p = write(&dir, "a.cpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.definitions("add", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        let content = String::from_utf8_lossy(&res[0].content_bytes);
+        assert!(content.starts_with("/// Compute"), "definition content should start with comment");
+        assert!(content.contains("return a + b"), "definition content should include body");
+        // Byte-fidelity.
+        let disk = fs::read(&p).unwrap();
+        let span = &res[0].source_ref.span;
+        assert_eq!(&disk[span.start_byte..span.end_byte], res[0].content_bytes.as_slice());
+        assert_eq!(span.start_line, 1);
+    }
+
+    #[test]
+    fn no_comment_span_is_unchanged() {
+        // When there is no leading comment the span and content are as before.
+        let dir = TempDir::new().unwrap();
+        let body = "void InitPool(size_t n);\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("InitPool", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        let content = String::from_utf8_lossy(&res[0].content_bytes);
+        assert!(content.starts_with("void InitPool"), "no comment — content starts at declaration");
+        assert_eq!(res[0].source_ref.span.start_line, 1);
+        assert!(res[0].symbol.doc.is_none());
+    }
+
+    #[test]
+    fn block_comment_included_in_content_with_byte_fidelity() {
+        // Multi-line Doxygen block comment is included and byte-exact.
+        let dir = TempDir::new().unwrap();
+        let body = "/**\n * @brief Frobnicate.\n * @param n count\n */\nvoid Frob(int n);\n";
+        let p = write(&dir, "a.hpp", body);
+        let eng = SyntacticEngine::new();
+        let res = eng.declarations("Frob", &candidates_for(&p));
+        assert_eq!(res.len(), 1);
+        let content = String::from_utf8_lossy(&res[0].content_bytes);
+        assert!(content.starts_with("/**"), "block comment must be in content");
+        assert!(content.contains("void Frob(int n);"), "declaration must follow comment in content");
+        let disk = fs::read(&p).unwrap();
+        let span = &res[0].source_ref.span;
+        assert_eq!(&disk[span.start_byte..span.end_byte], res[0].content_bytes.as_slice());
+        assert_eq!(span.start_line, 1);
     }
 
     #[test]

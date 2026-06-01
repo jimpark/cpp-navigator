@@ -230,19 +230,25 @@ fn try_resolve_entity(
         return None;
     }
 
-    let content_bytes = src[start_byte..end_byte].to_vec();
     let model_kind = entity_kind_to_model_kind(kind, mode);
     let name = entity.get_name().unwrap_or_default();
-
-    // Build qualified name from semantic parents.
     let qualified_name = build_qualified_name(entity);
 
-    let (signature, type_spelling, doc) = if mode == SemanticMode::Declaration {
+    // Extend the reported span backward to include any leading doc comment so
+    // that `content` carries the full context, matching the fallback path.
+    let doc_comment = entity.get_comment();
+    let (content_start_byte, content_start_line) =
+        leading_comment_start(&src, start_line as usize)
+            .unwrap_or((start_byte, start_line as usize));
+
+    let content_bytes = src[content_start_byte..end_byte].to_vec();
+
+    let (signature, type_spelling) = if mode == SemanticMode::Declaration {
         let sig = entity.get_display_name();
         let type_str = entity.get_type().map(|t| t.get_display_name());
-        (sig, type_str, entity.get_comment())
+        (sig, type_str)
     } else {
-        (None, None, None)
+        (None, None)
     };
 
     Some(Resolution {
@@ -252,16 +258,16 @@ fn try_resolve_entity(
             kind: model_kind,
             signature,
             type_spelling,
-            doc,
+            doc: doc_comment,
         },
         source_ref: SourceRef {
             file_path,
             span: Span {
-                start_byte,
+                start_byte: content_start_byte,
                 end_byte,
-                start_line: start_line as usize,
+                start_line: content_start_line,
                 end_line: end_line as usize,
-                start_col: start_col as usize,
+                start_col: 0,
                 end_col: end_col as usize,
             },
         },
@@ -270,6 +276,49 @@ fn try_resolve_entity(
         confidence: SEMANTIC_CONFIDENCE,
         status: Status::Resolved,
     })
+}
+
+/// Scan `src` backward from `decl_start_line` (1-based) to find the start of a
+/// contiguous C/C++ comment block (`//…` or `/* … */`) that sits immediately
+/// above the declaration with no blank lines. Returns `(start_byte, start_line)`
+/// of the topmost comment line, or `None` when no adjacent comment exists.
+fn leading_comment_start(src: &[u8], decl_start_line: usize) -> Option<(usize, usize)> {
+    // Split into lines, keeping their byte offsets.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, &b) in src.iter().enumerate() {
+        if b == b'\n' && i + 1 < src.len() {
+            line_starts.push(i + 1);
+        }
+    }
+    if decl_start_line == 0 || decl_start_line > line_starts.len() {
+        return None;
+    }
+    // Walk upward from the line immediately above the declaration.
+    let mut comment_start: Option<(usize, usize)> = None;
+    let mut expected_next = decl_start_line - 1; // 1-based line we're examining
+    loop {
+        if expected_next == 0 {
+            break;
+        }
+        let line_idx = expected_next - 1; // 0-based index into line_starts
+        let line_start = line_starts[line_idx];
+        let line_end = if line_idx + 1 < line_starts.len() {
+            line_starts[line_idx + 1]
+        } else {
+            src.len()
+        };
+        let line = std::str::from_utf8(&src[line_start..line_end])
+            .unwrap_or("")
+            .trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            comment_start = Some((line_start, expected_next));
+            expected_next -= 1;
+        } else {
+            break; // blank line or code — stop
+        }
+    }
+    comment_start
 }
 
 /// Convert line:col (1-based) to byte offset.
