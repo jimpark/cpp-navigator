@@ -192,8 +192,19 @@ fn resolve_one(
         return Record::not_found(command, target);
     }
 
-    // find-refs: emit dense location list or contextual bodies.
+    // find-refs: emit dense location list or contextual bodies. For a qualified
+    // target, first drop hits the engine can prove belong to a different scope.
     if query == Query::References {
+        let filtered;
+        let result = if target.contains("::") {
+            filtered = FinderResult {
+                candidates: engine.filter_references(target, &result.candidates),
+                truncated: result.truncated,
+            };
+            &filtered
+        } else {
+            result
+        };
         return resolve_refs(command, target, context, result, engine, cli);
     }
 

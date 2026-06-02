@@ -40,4 +40,17 @@ pub trait Engine {
     /// not lexically inside a class/struct body (e.g. a free function or an
     /// out-of-line member definition `void C::m() {}`).
     fn enclosing_class_scope(&self, file: &Path, byte_offset: usize) -> Option<Span>;
+
+    /// Prune find-refs hits that the engine can *prove* belong to a different
+    /// scope than a qualified `target` (design-specs §9 — precision pass).
+    ///
+    /// Only fires for qualified targets (`A::name`). A hit is dropped only when
+    /// every determinable occurrence of the name on that line resolves to an
+    /// incompatible scope — an explicit `Other::name` use, or a same-named
+    /// member declared in a different class. Bare calls, member accesses
+    /// (`x.name`), and anything the engine cannot place are *kept* (precision
+    /// must never cost recall). The default keeps every candidate.
+    fn filter_references(&self, _target: &str, candidates: &[Candidate]) -> Vec<Candidate> {
+        candidates.to_vec()
+    }
 }
