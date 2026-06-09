@@ -46,13 +46,80 @@ A short alias `cppnav` is installed alongside `cpp-navigator`.
 
 ### Semantic backend (optional)
 
-The default build uses tree-sitter and is fully self-contained (no system dependencies). For higher precision — accurate overload disambiguation, template resolution — enable the libclang backend:
+The default build uses tree-sitter and is fully self-contained (no system dependencies). For higher precision — accurate overload disambiguation, template instantiation, namespace-aware qualified names — enable the libclang backend. This is the "release version with semantic support."
+
+Two things are required, and they are independent:
+
+1. **A build compiled with the `semantic` feature** (links a system `libclang`).
+2. **A `compile_commands.json`** for the tree you query (gives clang the exact flags each file is compiled with).
+
+If either is missing, the tool silently falls back to the self-contained tree-sitter engine — it never hard-fails. That means a missing dependency looks like "semantic mode did nothing," so the steps below also show how to confirm it is actually active.
+
+#### Step 1 — Install a system libclang
+
+The `semantic` feature links `libclang` at build time and loads it at runtime. Install LLVM/Clang for your platform; if it lands somewhere non-standard, point `LIBCLANG_PATH` at the directory containing the `libclang` shared library.
+
+| Platform | Install | If not auto-detected |
+|----------|---------|----------------------|
+| macOS | `brew install llvm` | `export LIBCLANG_PATH="$(brew --prefix llvm)/lib"` |
+| Debian/Ubuntu | `sudo apt install libclang-dev` | `export LIBCLANG_PATH=/usr/lib/llvm-<ver>/lib` |
+| Fedora | `sudo dnf install clang-devel` | `export LIBCLANG_PATH=/usr/lib64` |
+| Windows | Install [LLVM](https://releases.llvm.org/) (e.g. `winget install LLVM.LLVM`) | `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"` |
+
+#### Step 2 — Install the binary with the feature enabled
 
 ```sh
+# Install both binaries (cpp-navigator + cppnav) with semantic support
+cargo install --path . --features semantic
+
+# Or, for a local build without installing:
 cargo build --release --features semantic
+# binary at target/release/cpp-navigator
 ```
 
-Requires a system `libclang` (e.g. `brew install llvm`) and a `compile_commands.json` in the search root. The default tree-sitter backend is used automatically when `compile_commands.json` is absent.
+On Windows, set `LIBCLANG_PATH` before the build if LLVM is not on the default search path:
+
+```powershell
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+cargo install --path . --features semantic
+```
+
+#### Step 3 — Generate a `compile_commands.json`
+
+libclang needs the real compile flags (include paths, `-std`, defines) for each translation unit. Produce a compilation database from your build system:
+
+```sh
+# CMake — the simplest path; works with Make or Ninja generators
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+# build/compile_commands.json now exists
+
+# Make-based projects without CMake — use Bear to intercept the compiler
+bear -- make
+
+# Ninja
+ninja -C build -t compdb > build/compile_commands.json
+```
+
+#### Step 4 — Run a semantic query
+
+By default the database is looked up in the **search root** (`--root`, default `.`), non-recursively. So either query the directory that holds `compile_commands.json`, or point at it explicitly with `--compile-db`:
+
+```sh
+# compile_commands.json sits in ./build alongside the sources you query
+cpp-navigator find-def MyTemplate --root ./build --semantic
+
+# Sources live elsewhere; pass the database path explicitly
+cpp-navigator find-def Widget::Draw \
+  --root ./src --semantic --compile-db ./build/compile_commands.json
+```
+
+#### Verifying semantic mode is active
+
+Every record carries an `"engine"` field. Semantic resolution reports `"engine": "libclang"`; the tree-sitter fallback reports `"engine": "tree-sitter"`. If you pass `--semantic` but still see `tree-sitter`, one of the requirements is unmet:
+
+- **Built without the feature** — running `--semantic` on a default build prints `--semantic requires a build with --features semantic; using tree-sitter` to stderr (suppress with `--quiet`). Reinstall with `--features semantic`.
+- **Database not found** — confirm `compile_commands.json` is in the `--root` directory or passed via `--compile-db`.
+- **libclang not loadable at runtime** — set `LIBCLANG_PATH` to the directory containing the shared library.
 
 ## How it works
 
