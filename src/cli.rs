@@ -115,6 +115,24 @@ pub struct Cli {
     /// Suppress stderr diagnostics.
     #[arg(long, global = true)]
     pub quiet: bool,
+
+    /// Browse the results in an interactive terminal tree instead of
+    /// printing them: navigate with arrows/j/k/h/l, Enter opens the line
+    /// under the cursor (handed to a detected IDE's integrated terminal —
+    /// VS Code, a JetBrains IDE, Zed — or spawned as a terminal editor).
+    #[arg(long = "interactive", short = 'i', global = true)]
+    pub interactive: bool,
+
+    /// Editor to spawn from the interactive browser when not running
+    /// inside a detected IDE. Defaults to $VISUAL, then $EDITOR, then a
+    /// platform default.
+    #[arg(long, global = true, value_name = "CMD")]
+    pub editor: Option<String>,
+
+    /// Override the {file}/{line}/{column} template used to open a line in
+    /// the configured editor (normally guessed from its basename).
+    #[arg(long, global = true, value_name = "TEMPLATE")]
+    pub editor_template: Option<String>,
 }
 
 /// The three query commands (design-specs §7).

@@ -12,6 +12,7 @@
 pub mod cli;
 pub mod commands;
 pub mod engine;
+pub mod interactive;
 pub mod model;
 pub mod output;
 pub mod search;

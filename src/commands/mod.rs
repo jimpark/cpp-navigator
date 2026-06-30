@@ -122,6 +122,19 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
         records.push(record);
     }
 
+    // Interactive mode browses the raw records directly (full content, no
+    // budget trimming) instead of writing them — it's for human eyes, not
+    // the wire format, so the normal output projection doesn't apply.
+    if cli.interactive {
+        return crate::interactive::run(
+            &records,
+            command_name,
+            &all_targets,
+            cli.editor.as_deref(),
+            cli.editor_template.as_deref(),
+        );
+    }
+
     records = output::project_records(records, cli.format, &cli.include);
 
     // Apply --budget trimming if requested (design-specs §8.10).
@@ -782,6 +795,9 @@ mod tests {
             budget: None,
             empty_macro: vec![],
             quiet: false,
+            interactive: false,
+            editor: None,
+            editor_template: None,
         };
         let record = resolve_refs("find-refs", "helper", true, &result, &eng, &cli);
         assert_eq!(record.resolution_type, "references_with_context");
@@ -829,6 +845,9 @@ mod tests {
             budget: None,
             empty_macro: vec![],
             quiet: false,
+            interactive: false,
+            editor: None,
+            editor_template: None,
         };
         let record = resolve_refs("find-refs", "val", true, &result, &eng, &cli);
         // All refs in the same function → deduplicated to one context entry.
@@ -988,6 +1007,9 @@ mod tests {
             budget: None,
             empty_macro: vec![],
             quiet: false,
+            interactive: false,
+            editor: None,
+            editor_template: None,
         };
         let record = resolve_refs("find-refs", "OnCreate", true, &result, &eng, &cli);
         assert_eq!(record.resolution_type, "references_with_context");
@@ -1109,6 +1131,9 @@ mod tests {
             budget: None,
             empty_macro: vec![],
             quiet: false,
+            interactive: false,
+            editor: None,
+            editor_template: None,
         };
         let record = resolve_one("find-decl", "helper", Query::Declaration, false, false, &result, &eng, &std::collections::HashSet::new(), &cli);
         assert_eq!(record.status, output::Status::Resolved);
@@ -1152,6 +1177,9 @@ mod tests {
             budget: None,
             empty_macro: vec![],
             quiet: false,
+            interactive: false,
+            editor: None,
+            editor_template: None,
         };
         let record = resolve_one("find-decl", "process", Query::Declaration, false, false, &result, &eng, &std::collections::HashSet::new(), &cli);
         assert_eq!(record.status, output::Status::Resolved);
@@ -1197,6 +1225,9 @@ mod tests {
             budget: None,
             empty_macro: vec![],
             quiet: false,
+            interactive: false,
+            editor: None,
+            editor_template: None,
         };
         let record = resolve_one("find-decl", "compute", Query::Declaration, false, false, &result, &eng, &std::collections::HashSet::new(), &cli);
         assert_eq!(record.status, output::Status::Resolved);
@@ -1257,6 +1288,9 @@ mod tests {
             budget: None,
             empty_macro: vec![],
             quiet: false,
+            interactive: false,
+            editor: None,
+            editor_template: None,
         };
         let record = resolve_one("find-decl", "square", Query::Declaration, false, false, &result, &eng, &std::collections::HashSet::new(), &cli);
         assert_eq!(record.status, output::Status::Resolved);
@@ -1284,6 +1318,9 @@ mod tests {
             budget: None,
             empty_macro: vec![],
             quiet: false,
+            interactive: false,
+            editor: None,
+            editor_template: None,
         }
     }
 

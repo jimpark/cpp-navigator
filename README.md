@@ -175,6 +175,9 @@ All three commands accept multiple names and a `--manifest` file.
 | `--compile-db <PATH>` | auto | Path to `compile_commands.json` |
 | `--jobs <N>` | #cores | Parser/walker threads |
 | `--quiet` | off | Suppress stderr diagnostics |
+| `--interactive`, `-i` | off | Browse the results in an interactive terminal tree instead of printing them |
+| `--editor <CMD>` | `$VISUAL`/`$EDITOR` | Editor to spawn from `--interactive` when not running inside a detected IDE |
+| `--editor-template <TPL>` | guessed | Override the `{file}`/`{line}`/`{column}` template used to open a line |
 
 #### `find-def` only
 
@@ -218,6 +221,43 @@ cpp-navigator find-decl ParseNode --root ./src --lang h,hpp
 # High-precision mode with compile_commands.json
 cpp-navigator find-def MyTemplate --root ./build --semantic
 ```
+
+## Interactive mode
+
+`--interactive` (`-i`) replaces the JSONL/bundle/human writer with a full-screen
+terminal tree: every resolved hit's source lines, grouped by file, navigable
+and openable on the spot.
+
+```sh
+cpp-navigator find-refs SetText --root ./src --interactive
+cppnav find-def Widget --root ./src -i
+```
+
+| Key | Action |
+|-----|--------|
+| `↑`/`↓` or `j`/`k` | Move the cursor |
+| `g` / `G` | Jump to the top / bottom |
+| `n` / `p` | Jump to the first line of the next / previous file (clamps at the ends with a status message — never wraps) |
+| `h`/`←`, `l`/`→` | Collapse / expand a folder |
+| `Enter` | Open the line under the cursor (toggles fold on a folder row) |
+| `/` | Filter the tree by a substring of the file path, line text, or label |
+| `:N` | Jump to row `N` (the leading number on each line row) |
+| `q` / `Esc` | Quit |
+
+Each hit's first line is the anchor (bold, labeled with the target,
+`resolution_type`, and line range); the rest of its excerpt follows as dimmed
+detail lines — every one of them independently jumpable, not just the anchor.
+
+**Opening a line.** Inside the integrated terminal of VS Code, a JetBrains IDE
+(CLion and friends), or Zed, the hit is handed to that already-running editor
+(a `vscode://` URL, or the `idea`/`clion`/`zed`-style CLI launcher) so it lands
+in a new tab there — detected via the environment variables those terminals
+inject (`TERM_PROGRAM`, `TERMINAL_EMULATOR`). Outside an IDE, a terminal editor
+is spawned instead: `--editor`, then `$VISUAL`, then `$EDITOR`, then a platform
+default. The `{file}`/`{line}`/`{column}` template is guessed from the
+editor's basename (`code -g` wants `{file}:{line}:{column}`, `vim` wants
+`+{line} {file}`, ...); override it with `--editor-template` for anything
+unrecognized.
 
 ## Output format
 
