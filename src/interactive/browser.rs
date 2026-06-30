@@ -292,14 +292,19 @@ impl Browser {
             return;
         }
         let line = row.line.clone().unwrap();
+        // Records carry root-relative paths with mixed separators (e.g.
+        // "src\widget.cpp"); IDE hand-offs and spawned editors all need an
+        // absolute path, so resolve it once here against the cwd.
+        let abs = absolute_path(&line.file);
+        let abs_str = abs.to_string_lossy();
         if let Some(ide) = &self.ide {
-            match ide.open(&line.file, line.line, 1) {
+            match ide.open(&abs_str, line.line, 1) {
                 Ok(()) => self.status = format!("opened {}:{} in {}", line.file, line.line, ide.label()),
                 Err(_) => self.status = ide.open_error(),
             }
             return;
         }
-        let argv = super::editor::open_args(&self.editor_argv, &self.line_template, &line.file, line.line, 1);
+        let argv = super::editor::open_args(&self.editor_argv, &self.line_template, &abs_str, line.line, 1);
         let Some((cmd, args)) = argv.split_first() else { return };
         leave_screen();
         let result = Command::new(cmd).args(args).status();
@@ -459,9 +464,14 @@ impl Browser {
         }
 
         print_line(&mut out, &"-".repeat(cols), cols, None, None)?;
+        // Bottom row: print the footer with NO trailing newline. On Windows
+        // consoles a newline on the last row scrolls the whole buffer up one
+        // line, which the next frame's MoveTo(0,0) snaps back — a visible
+        // bounce as you navigate. Parking the cursor on the footer (then
+        // clearing anything below) avoids it. Clear-to-end also wipes any
+        // stale characters left on the footer line itself.
         let footer = truncate(&self.footer_text(), cols);
-        print_line(&mut out, &footer, cols, None, None)?;
-        queue!(out, Clear(ClearType::FromCursorDown))?;
+        queue!(out, Print(&footer), Clear(ClearType::FromCursorDown))?;
         out.flush()
     }
 
@@ -482,6 +492,14 @@ impl Browser {
 
 fn truncate(s: &str, cols: usize) -> String {
     s.chars().take(cols).collect()
+}
+
+/// Resolve a (possibly root-relative, mixed-separator) record path to an
+/// absolute path, without touching the filesystem or adding Windows'
+/// `\\?\` extended-length prefix. Falls back to the path as-given if the
+/// cwd can't be determined.
+fn absolute_path(rel: &str) -> std::path::PathBuf {
+    std::path::absolute(rel).unwrap_or_else(|_| std::path::PathBuf::from(rel))
 }
 
 fn row_color(row: &Row) -> Option<Color> {

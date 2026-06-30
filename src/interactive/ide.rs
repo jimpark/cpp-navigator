@@ -34,7 +34,16 @@ impl Ide {
     pub fn open(&self, path: &str, line: usize, column: usize) -> std::io::Result<()> {
         match self {
             Ide::VsCode => {
-                open_url(&format!("vscode://file{path}:{line}:{column}"));
+                // `path` is an absolute native path; on Windows that's
+                // "C:\dir\file.cpp" — a drive letter, backslashes, no leading
+                // slash, none of which is valid inside a URI, so the naive
+                // "vscode://file" + path silently produced a URL VS Code's
+                // handler couldn't parse (it claimed to open but nothing
+                // happened). `vscode_uri_path` forces forward slashes, adds
+                // the leading "/", and percent-encodes spaces and the like;
+                // on POSIX an already-absolute path passes through unchanged.
+                let uri_path = vscode_uri_path(path);
+                open_url(&format!("vscode://file{uri_path}:{line}:{column}"));
                 Ok(())
             }
             Ide::JetBrains { launcher, .. } => {
@@ -64,6 +73,28 @@ fn spawn_detached(program: &str, args: &[&str]) -> std::io::Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
+}
+
+/// Turn an absolute filesystem path into the path portion of a `vscode://
+/// file<path>` URL: backslashes become forward slashes, a leading slash is
+/// guaranteed (so a Windows `C:/...` becomes `/C:/...`), and anything
+/// outside the URI-safe set is percent-encoded. POSIX paths already start
+/// with `/` and rarely need encoding, so they pass through near-verbatim.
+fn vscode_uri_path(path: &str) -> String {
+    let forward: String = path.chars().map(|c| if c == '\\' { '/' } else { c }).collect();
+    let rooted = if forward.starts_with('/') { forward } else { format!("/{forward}") };
+    let mut out = String::with_capacity(rooted.len());
+    for b in rooted.bytes() {
+        // Keep RFC 3986 unreserved chars plus the path separators we rely on
+        // ('/' and the drive-letter ':'); percent-encode every other byte
+        // (which, for UTF-8, encodes each multibyte sequence byte by byte).
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn open_url(url: &str) {
@@ -143,4 +174,24 @@ pub fn detect() -> Option<Ide> {
         return Some(Ide::Zed);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_path_becomes_a_valid_vscode_uri_path() {
+        assert_eq!(vscode_uri_path("C:\\tools\\cpp-navigator\\src\\main.rs"), "/C:/tools/cpp-navigator/src/main.rs");
+    }
+
+    #[test]
+    fn posix_absolute_path_passes_through() {
+        assert_eq!(vscode_uri_path("/home/u/proj/main.cpp"), "/home/u/proj/main.cpp");
+    }
+
+    #[test]
+    fn spaces_and_specials_are_percent_encoded() {
+        assert_eq!(vscode_uri_path("C:\\a dir\\f#1.cpp"), "/C:/a%20dir/f%231.cpp");
+    }
 }
