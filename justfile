@@ -10,3 +10,4 @@ fmt:
 
 install: build
     cp target/release/cpp-navigator.exe /c/tools/cpp-navigator.exe
+    cp target/release/cppnav.exe /c/tools/cppnav.exe
