@@ -438,6 +438,14 @@ Targets may be bare (`Draw`) or qualified (`Widget::Draw`, `ui::Widget::Draw`). 
 
 `--budget N` trims the output to approximately N estimated tokens using selection-only trimming: inner arrays are shortened before whole records are dropped. Payload bytes are never edited — fidelity is an invariant.
 
+## Agent skill
+
+`skills/cpp-navigator/SKILL.md` is a portable [Agent Skill](https://agentskills.io)
+that teaches an LLM coding agent (Claude Code, GitHub Copilot, ...) how to use
+this tool to explore a C/C++ codebase. It's tracked here so it evolves with
+the CLI, but it's for use in *other* C/C++ projects that have `cpp-navigator`
+installed — see `skills/README.md` for how to deploy it there.
+
 ## Building and testing
 
 ```sh
