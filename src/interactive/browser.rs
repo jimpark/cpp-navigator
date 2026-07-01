@@ -48,7 +48,16 @@ pub struct Browser {
     query: String,
     mode: Mode,
     expanded: HashSet<String>,
+    /// The built tree, cached alongside the query that produced it. Folding
+    /// only toggles `expanded` (which `build_visible` reads directly), so the
+    /// tree is reused across expand/collapse and rebuilt only when the filter
+    /// query changes — avoiding a clone of every line plus a full re-weave.
+    node_cache: Option<(String, Node)>,
     rows: Vec<Row>,
+    /// Header tallies, recomputed only in `rebuild` rather than on every
+    /// frame, so navigation doesn't pay an O(rows) pass per keypress.
+    line_count: usize,
+    file_count: usize,
     cursor: usize,
     cur_id: Option<String>,
     top: usize,
@@ -78,7 +87,10 @@ impl Browser {
             query: String::new(),
             mode: Mode::Browse,
             expanded,
+            node_cache: None,
             rows: Vec::new(),
+            line_count: 0,
+            file_count: 0,
             cursor: 0,
             cur_id: None,
             top: 0,
@@ -115,8 +127,18 @@ impl Browser {
     }
 
     fn rebuild(&mut self) {
-        let node = self.build_node();
-        self.rows = tree::build_visible(&node, &self.expanded);
+        // Rebuild the tree only when the filter query changed; a fold/unfold
+        // leaves the tree identical and merely re-flattens it below.
+        let reuse = matches!(&self.node_cache, Some((q, _)) if *q == self.query);
+        if !reuse {
+            let node = self.build_node();
+            self.node_cache = Some((self.query.clone(), node));
+        }
+        self.rows = {
+            let node = &self.node_cache.as_ref().unwrap().1;
+            tree::build_visible(node, &self.expanded)
+        };
+        self.retally();
         if let Some(id) = &self.cur_id {
             if let Some(i) = self.rows.iter().position(|r| &r.id == id) {
                 self.cursor = i;
@@ -128,6 +150,15 @@ impl Browser {
         }
         self.cursor = if self.rows.is_empty() { 0 } else { self.cursor.min(self.rows.len() - 1) };
         self.cur_id = self.rows.get(self.cursor).map(|r| r.id.clone());
+    }
+
+    /// Recompute the header tallies (line count and distinct file count)
+    /// from the current rows. Called from `rebuild` only — never per frame.
+    fn retally(&mut self) {
+        self.line_count = self.rows.iter().filter(|r| !r.is_folder).count();
+        let files: HashSet<&str> =
+            self.rows.iter().filter_map(|r| r.line.as_ref()).map(|l| l.file.as_str()).collect();
+        self.file_count = files.len();
     }
 
     fn first_line_index(&self) -> usize {
@@ -156,26 +187,43 @@ impl Browser {
         self.sync_id();
     }
 
+    /// Open the folder at `index` incrementally: record it as expanded and
+    /// splice its subtree into `rows`, rather than rebuilding the whole list.
+    /// Only the header tallies and cursor id need refreshing afterwards.
+    fn expand_at(&mut self, index: usize) {
+        let path = self.rows[index].id.trim_start_matches("F:").to_string();
+        self.expanded.insert(path);
+        tree::splice_expand(&mut self.rows, index, &self.node_cache.as_ref().unwrap().1, &self.expanded);
+        self.retally();
+        self.sync_id();
+    }
+
+    /// Close the folder at `index` incrementally: forget it as expanded and
+    /// splice its subtree back out of `rows`.
+    fn collapse_at(&mut self, index: usize) {
+        let path = self.rows[index].id.trim_start_matches("F:").to_string();
+        self.expanded.remove(&path);
+        tree::splice_collapse(&mut self.rows, index);
+        self.retally();
+        self.sync_id();
+    }
+
     fn expand(&mut self) {
         let Some(row) = self.rows.get(self.cursor) else { return };
         if !row.is_folder {
             return;
         }
-        let path = row.id.trim_start_matches("F:").to_string();
         if row.expanded {
             self.move_cursor(1);
         } else {
-            self.expanded.insert(path);
-            self.rebuild();
+            self.expand_at(self.cursor);
         }
     }
 
     fn collapse(&mut self) {
         let Some(row) = self.rows.get(self.cursor) else { return };
         if row.is_folder && row.expanded {
-            let path = row.id.trim_start_matches("F:").to_string();
-            self.expanded.remove(&path);
-            self.rebuild();
+            self.collapse_at(self.cursor);
             return;
         }
         let path = if row.is_folder {
@@ -217,13 +265,11 @@ impl Browser {
     /// Land the cursor on the first line under the file row at `file_idx`,
     /// expanding it first if it's currently folded.
     fn goto_file(&mut self, file_idx: usize) {
-        let mut idx = file_idx;
+        let idx = file_idx;
         if !self.rows[idx].expanded {
-            let file_id = self.rows[idx].id.clone();
-            let path = file_id.trim_start_matches("F:").to_string();
-            self.expanded.insert(path);
-            self.rebuild();
-            idx = self.rows.iter().position(|r| r.id == file_id).unwrap_or(idx);
+            // Splicing keeps the folder row at the same index, so no lookup
+            // of the row's new position is needed afterward.
+            self.expand_at(idx);
         }
         let mut target = idx;
         if target + 1 < self.rows.len() && self.rows[target + 1].depth > self.rows[target].depth {
@@ -282,13 +328,11 @@ impl Browser {
     fn open_current(&mut self) {
         let Some(row) = self.rows.get(self.cursor) else { return };
         if row.is_folder {
-            let path = row.id.trim_start_matches("F:").to_string();
-            if self.expanded.contains(&path) {
-                self.expanded.remove(&path);
+            if row.expanded {
+                self.collapse_at(self.cursor);
             } else {
-                self.expanded.insert(path);
+                self.expand_at(self.cursor);
             }
-            self.rebuild();
             return;
         }
         let line = row.line.clone().unwrap();
@@ -433,17 +477,14 @@ impl Browser {
             Mode::Browse => "BROWSE",
             Mode::Filter => "FILTER",
         };
-        let files: HashSet<&str> =
-            self.rows.iter().filter_map(|r| r.line.as_ref()).map(|l| l.file.as_str()).collect();
-        let line_count = self.rows.iter().filter(|r| !r.is_folder).count();
         let header = format!(
             " {}    [{}]    {} line{} in {} file{}",
             self.title,
             mode_label,
-            line_count,
-            if line_count == 1 { "" } else { "s" },
-            files.len(),
-            if files.len() == 1 { "" } else { "s" },
+            self.line_count,
+            if self.line_count == 1 { "" } else { "s" },
+            self.file_count,
+            if self.file_count == 1 { "" } else { "s" },
         );
         print_line(&mut out, &truncate(&header, cols), cols, None, Some(Attribute::Bold))?;
         print_line(&mut out, &"-".repeat(cols), cols, None, None)?;
